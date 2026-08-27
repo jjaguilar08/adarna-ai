@@ -11,3 +11,6 @@ __pycache__/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local running notes, never pushed
+project_notes.md
