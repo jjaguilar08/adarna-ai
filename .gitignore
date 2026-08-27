@@ -1,0 +1,13 @@
+# Python virtual environments
+windows_app/.venv/
+wsl_app/.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS junk
+.DS_Store
+Thumbs.db
