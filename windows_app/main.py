@@ -25,7 +25,7 @@ def load_port():
     return config["port"]
 
 
-class IpcClient(QObject):
+class WslConnection(QObject):
     """
     Talks to wsl_app over a socket on a background thread and reports
     connection status back to the Qt main thread via a signal. See
@@ -101,31 +101,31 @@ def create_status_label(window):
     return label
 
 
-def start_ipc_client(status_label):
+def start_wsl_connection(status_label):
     """
     Starts the background thread that connects to wsl_app and keeps
     status_label in sync with the connection state.
 
     Returns:
-        IpcClient: the client object driving the background thread.
+        WslConnection: the connection object driving the background thread.
     """
-    client = IpcClient()
-    client.connection_changed.connect(
+    wsl_connection = WslConnection()
+    wsl_connection.connection_changed.connect(
         lambda connected: status_label.setText("Connected" if connected else "Disconnected")
     )
-    threading.Thread(target=client.run, daemon=True).start()
-    return client
+    threading.Thread(target=wsl_connection.run, daemon=True).start()
+    return wsl_connection
 
 
 def main():
     """
-    Entry point: creates the app and window, starts the background IPC
-    client, and runs the event loop until the window is closed.
+    Entry point: creates the app and window, starts the background
+    connection to wsl_app, and runs the event loop until the window is closed.
     """
     app = create_app()
     window = create_window()
     status_label = create_status_label(window)
-    start_ipc_client(status_label)
+    start_wsl_connection(status_label)
     window.show()
     sys.exit(app.exec())
 
