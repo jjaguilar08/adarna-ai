@@ -7,6 +7,8 @@ import asyncio
 import audioop
 import base64
 import json
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -460,6 +462,99 @@ async def run_server(model):
     print(f"wsl_app listening on 127.0.0.1:{port}")
     async with server:
         await server.serve_forever()
+
+
+# The framing given to every prompt sent through ClaudeCli. Hardcoded for now;
+# switching this based on interview vs. meeting mode is a later day's job.
+CLAUDE_CLI_SYSTEM_PROMPT = (
+    "You are assisting the user live during a work meeting. Given a snippet "
+    "of recent conversation, suggest a brief, natural response they could "
+    "say next."
+)
+
+
+class ClaudeCli:
+    """
+    Keeps one `claude` command-line process running in the background and
+    lets short text prompts be sent to it one at a time, getting a text
+    answer back for each. Starting the process takes a few seconds, so it's
+    started once and reused for every prompt rather than restarted each
+    time — later prompts answer noticeably faster than the first because of
+    this. The same running process also remembers earlier prompts on its
+    own, so later prompts can refer back to earlier ones without this class
+    needing to resend the earlier conversation itself.
+
+    Not yet used by the live transcript pipeline (see wsl_app/test_claude_cli.py
+    for a standalone way to try it out) — wiring it into handle_client() so
+    suggestions actually reach windows_app is a later day's job.
+    """
+
+    def __init__(self):
+        """Starts the claude command-line process running in the background, ready for prompts."""
+        self._process = subprocess.Popen(
+            [
+                "claude",
+                "-p",
+                "--input-format", "stream-json",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
+                "--tools", "",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        threading.Thread(target=self._log_error_output, daemon=True).start()
+
+    def _log_error_output(self):
+        """
+        Runs for the lifetime of the process on its own background thread:
+        reads anything the claude command-line process writes to its error
+        output and logs it. Error output is a separate stream from the one
+        answers come back on, so this can't block or interfere with ask()
+        — it just means an unexpected error is never silently lost.
+        """
+        for line in self._process.stderr:
+            print(f"claude CLI error output: {line.rstrip()}")
+
+    def ask(self, prompt_text):
+        """
+        Sends one short text prompt to the running claude process and waits
+        for its complete answer. Safe to call more than once on the same
+        ClaudeCli — each call continues the same ongoing conversation.
+
+        Returns:
+            str: the answer text.
+        """
+        input_line = {"type": "user", "message": {"role": "user", "content": prompt_text}}
+        self._process.stdin.write(json.dumps(input_line) + "\n")
+        self._process.stdin.flush()
+        return self._read_next_answer()
+
+    def _read_next_answer(self):
+        """
+        Reads output lines from the claude process one at a time, skipping
+        everything that isn't the final line of a reply, until that final
+        line — marked with "type": "result" — arrives.
+
+        Returns:
+            str: the answer text carried on the result line.
+        """
+        while True:
+            line = self._process.stdout.readline()
+            if not line:
+                raise RuntimeError("claude CLI process ended unexpectedly")
+            output = json.loads(line)
+            if output.get("type") == "result":
+                return output.get("result", "")
+
+    def stop(self):
+        """Shuts the claude process down cleanly and waits for it to exit."""
+        self._process.stdin.close()
+        self._process.wait()
 
 
 def main():
