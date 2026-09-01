@@ -40,6 +40,12 @@ SILENCE_SECONDS_TO_CLOSE_SEGMENT = 0.4
 # so one uninterrupted run-on sentence can't grow the buffer forever.
 MAX_SEGMENT_SECONDS = 20.0
 
+# Segments shorter than this are almost always a false positive from the
+# speech detector (a brief noise blip, not real speech), so skip the
+# (expensive) transcription call for them entirely rather than spending a
+# full model call for nothing.
+MIN_SEGMENT_SECONDS_TO_TRANSCRIBE = 0.3
+
 WHISPER_MODEL_NAME = "small.en"
 
 
@@ -226,6 +232,21 @@ class VoiceSegmenter:
         self._seconds_recorded_in_current_segment = 0.0
         return finished_segment_audio
 
+    def close_open_segment(self):
+        """
+        Force-closes whatever segment is currently in progress, if any.
+        Used when a session stops, so audio that hasn't hit a silence gap
+        yet (someone stops the session right after finishing a sentence)
+        isn't silently dropped.
+
+        Returns:
+            bytes | None: the finished segment's audio, or None if nothing
+            was open.
+        """
+        if not self._segment_is_open:
+            return None
+        return self._close_current_segment()
+
 
 def load_whisper_model():
     """
@@ -268,13 +289,31 @@ def transcribe_audio(model, audio_bytes):
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-async def transcribe_and_log(model, audio_bytes):
+def segment_duration_seconds(audio_bytes):
+    """
+    Returns:
+        float: how many seconds of audio `audio_bytes` (16-bit mono PCM at
+        TARGET_SAMPLE_RATE) represents.
+    """
+    return len(audio_bytes) / 2 / TARGET_SAMPLE_RATE
+
+
+async def send_message(writer, message):
+    """
+    Writes one JSON message to a connected windows_app client.
+    """
+    writer.write((json.dumps(message) + "\n").encode())
+    await writer.drain()
+
+
+async def transcribe_segment_and_report(model, writer, audio_bytes):
     """
     Transcribes one closed speech segment in a background thread (keeping
-    the event loop free to keep reading incoming audio_chunk messages) and
-    logs the result with a timestamp.
+    the event loop free to keep reading incoming messages), logs the
+    result with a timestamp, and — if it contains real text — sends it to
+    windows_app as a transcript message.
     """
-    duration_seconds = len(audio_bytes) / 2 / TARGET_SAMPLE_RATE
+    duration_seconds = segment_duration_seconds(audio_bytes)
     started_at = time.monotonic()
     text = await asyncio.to_thread(transcribe_audio, model, audio_bytes)
     elapsed_seconds = time.monotonic() - started_at
@@ -284,6 +323,25 @@ async def transcribe_and_log(model, audio_bytes):
         f"[{timestamp}] Transcript ({duration_seconds:.1f}s segment, "
         f"{elapsed_seconds:.1f}s to transcribe): {spoken_text}"
     )
+    if text:
+        await send_message(
+            writer, {"type": "transcript", "text": text, "duration_seconds": duration_seconds}
+        )
+
+
+def handle_finished_segment(model, writer, audio_bytes):
+    """
+    Decides what to do with one just-closed speech segment: skip
+    transcription entirely if it's too short to plausibly be real speech
+    (a false positive from the speech detector that would otherwise cost a
+    full, slow model call for nothing), or kick off background
+    transcription-and-reporting otherwise.
+    """
+    duration_seconds = segment_duration_seconds(audio_bytes)
+    if duration_seconds < MIN_SEGMENT_SECONDS_TO_TRANSCRIBE:
+        print(f"Skipping {duration_seconds:.2f}s segment: below minimum duration, likely not real speech")
+        return
+    asyncio.create_task(transcribe_segment_and_report(model, writer, audio_bytes))
 
 
 class AudioLevelTracker:
@@ -320,12 +378,12 @@ class AudioLevelTracker:
             self._peak_amplitude = 0.0
 
 
-def handle_audio_chunk(model, tracker, segmenter, message):
+def handle_audio_chunk(model, tracker, segmenter, writer, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
     one-second stats, and feeds it (converted to the common 16kHz mono
-    format) into the VAD segmenter. Any speech segment the segmenter just
-    closed is handed off for background transcription.
+    format) into the speech segmenter. Any speech segment the segmenter
+    just closed is handed off to handle_finished_segment().
     """
     samples = decode_audio_chunk(message)
     if samples is None:
@@ -334,33 +392,54 @@ def handle_audio_chunk(model, tracker, segmenter, message):
 
     audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
     for segment in segmenter.add_audio(audio_bytes):
-        asyncio.create_task(transcribe_and_log(model, segment))
+        handle_finished_segment(model, writer, segment)
 
 
 async def handle_client(model, reader, writer):
     """
     Services one connected windows_app client for the lifetime of the
     connection: reads newline-delimited JSON messages, replies to pings,
-    tracks audio level stats and runs speech segmentation/transcription
-    for audio_chunk messages, and logs connect/disconnect.
+    tracks audio level stats, and manages the current session's speech
+    segmentation/transcription.
+
+    A "session" is bounded by explicit session_started/session_stopped
+    messages from windows_app. audio_chunk messages are only processed
+    while a session is active — one that arrives outside a session is
+    ignored (defensive: windows_app should only be capturing during a
+    session anyway). Starting a session creates a fresh VoiceSegmenter, so
+    buffered state never bleeds across sessions; stopping one force-closes
+    whatever segment is still open so a sentence finished right before
+    stopping isn't silently dropped.
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
     audio_tracker = AudioLevelTracker()
-    segmenter = VoiceSegmenter()
+    session_segmenter = None
     try:
         while True:
             line = await reader.readline()
             if not line:
                 break
             message = json.loads(line)
-            if message.get("type") == "audio_chunk":
-                handle_audio_chunk(model, audio_tracker, segmenter, message)
-                continue
-            reply = await build_reply(message)
-            if reply is not None:
-                writer.write((json.dumps(reply) + "\n").encode())
-                await writer.drain()
+            message_type = message.get("type")
+
+            if message_type == "session_started":
+                session_segmenter = VoiceSegmenter()
+                print("Session started")
+            elif message_type == "session_stopped":
+                if session_segmenter is not None:
+                    leftover_audio = session_segmenter.close_open_segment()
+                    if leftover_audio is not None:
+                        handle_finished_segment(model, writer, leftover_audio)
+                    session_segmenter = None
+                print("Session stopped")
+            elif message_type == "audio_chunk":
+                if session_segmenter is not None:
+                    handle_audio_chunk(model, audio_tracker, session_segmenter, writer, message)
+            else:
+                reply = await build_reply(message)
+                if reply is not None:
+                    await send_message(writer, reply)
     finally:
         print(f"Client disconnected: {peer}")
         writer.close()
