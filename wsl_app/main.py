@@ -1,6 +1,7 @@
 import asyncio
-# audioop is used below to downmix/resample audio for speech detection and
-# transcription. It's deprecated and slated for removal in Python 3.13+;
+# audioop is used below to convert captured audio into the one consistent
+# format speech detection and transcription both need. It's deprecated and
+# slated for removal in Python 3.13+;
 # not an issue on this project's pinned 3.10.12, but flag it here so it's
 # not a silent trap if the interpreter version ever changes.
 import audioop
@@ -16,13 +17,29 @@ from faster_whisper import WhisperModel
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 STATS_WINDOW_SECONDS = 1.0
 
-# Speech detection (VAD) and transcription (Whisper) both want 16kHz mono.
+# Speech detection and transcription both want 16kHz mono audio.
 TARGET_SAMPLE_RATE = 16000
-VAD_FRAME_MS = 30
-VAD_FRAME_BYTES = int(TARGET_SAMPLE_RATE * VAD_FRAME_MS / 1000) * 2  # 16-bit samples
-VAD_AGGRESSIVENESS = 2
-SILENCE_CLOSE_SECONDS = 0.4
+
+# The speech detector (webrtcvad) can only judge audio in fixed-size
+# slices, one at a time — never a variable amount. 30 milliseconds is a
+# size it supports; everything below is derived from that.
+FRAME_DURATION_MS = 30
+FRAME_DURATION_SECONDS = FRAME_DURATION_MS / 1000
+BYTES_PER_FRAME = int(TARGET_SAMPLE_RATE * FRAME_DURATION_SECONDS) * 2  # 16-bit samples
+
+# webrtcvad's own "how strict should speech-detection be" setting, on its
+# own 0-3 scale: 0 accepts more borderline sound as speech, 3 rejects more
+# of it. 2 is a reasonable middle ground to start from.
+SPEECH_DETECTION_STRICTNESS = 2
+
+# How long a pause has to last before we consider a sentence "done" and
+# close the segment.
+SILENCE_SECONDS_TO_CLOSE_SEGMENT = 0.4
+
+# Safety net: force-close a segment after this long even without a pause,
+# so one uninterrupted run-on sentence can't grow the buffer forever.
 MAX_SEGMENT_SECONDS = 20.0
+
 WHISPER_MODEL_NAME = "small.en"
 
 
@@ -56,8 +73,8 @@ async def build_reply(message):
 
 def decode_audio_chunk(message):
     """
-    Decodes one audio_chunk message's base64 PCM payload into a numpy array
-    of samples, using the format fields included on the message.
+    Decodes one audio_chunk message's base64 audio payload into a numpy
+    array of samples, using the format fields included on the message.
 
     Returns:
         numpy.ndarray | None: the decoded samples, or None if sample_format
@@ -71,108 +88,143 @@ def decode_audio_chunk(message):
     return numpy.frombuffer(raw_bytes, dtype=numpy.float32)
 
 
-def resample_to_16k_mono_pcm(samples, sample_rate, channels):
+def convert_audio_to_common_format(samples, sample_rate, channels):
     """
-    Converts a chunk of interleaved float32 audio samples to 16-bit PCM
-    bytes, downmixed to mono and resampled to 16kHz — the format both
-    webrtcvad and faster-whisper expect. sample_rate/channels are read from
-    the message every time rather than assumed, since the capture device
-    (and therefore the format) can change on the windows_app side.
+    Converts one chunk of captured audio into the single consistent format
+    the speech-detection and transcription steps both need, no matter what
+    device or settings it was originally recorded with: a single channel
+    (not stereo) and a fixed 16,000 samples per second. sample_rate/channels
+    are read from the message every time rather than assumed, since the
+    capture device (and therefore its format) can change on the windows_app
+    side.
 
     Returns:
-        bytes: 16-bit PCM samples, mono, at TARGET_SAMPLE_RATE.
+        bytes: the converted audio, ready for the next step.
     """
     int16_samples = numpy.clip(samples, -1.0, 1.0)
     int16_samples = (int16_samples * 32767.0).astype(numpy.int16)
 
     if channels == 1:
-        pcm_bytes = int16_samples.tobytes()
+        audio_bytes = int16_samples.tobytes()
     elif channels == 2:
-        pcm_bytes = audioop.tomono(int16_samples.tobytes(), 2, 0.5, 0.5)
+        audio_bytes = audioop.tomono(int16_samples.tobytes(), 2, 0.5, 0.5)
     else:
         # audioop.tomono only understands stereo; average manually for
         # anything else (uncommon, but the device dropdown could pick one).
         frames = int16_samples.reshape(-1, channels)
-        pcm_bytes = frames.mean(axis=1).astype(numpy.int16).tobytes()
+        audio_bytes = frames.mean(axis=1).astype(numpy.int16).tobytes()
 
     if sample_rate != TARGET_SAMPLE_RATE:
-        pcm_bytes, _ = audioop.ratecv(pcm_bytes, 2, 1, sample_rate, TARGET_SAMPLE_RATE, None)
+        audio_bytes, _ = audioop.ratecv(audio_bytes, 2, 1, sample_rate, TARGET_SAMPLE_RATE, None)
 
-    return pcm_bytes
+    return audio_bytes
 
 
 class VoiceSegmenter:
     """
-    Buffers 16kHz mono PCM audio and slices it into speech segments using
-    webrtcvad: a segment starts on the first speech frame and closes after
-    roughly 400ms of continuous silence, or after a ~20s safety cutoff so
-    one long uninterrupted sentence can't grow the buffer forever.
+    Watches a steady stream of incoming audio and figures out where each
+    spoken sentence starts and ends, so each one can be sent to Whisper on
+    its own instead of transcribing everything as one giant blob.
+
+    How a segment opens and closes:
+      1. While nothing is being said, incoming audio is thrown away.
+      2. The moment speech is heard, a new segment starts recording.
+      3. The segment keeps recording through speech AND short pauses.
+      4. Once a pause has lasted SILENCE_SECONDS_TO_CLOSE_SEGMENT, the
+         segment is considered finished ("that was one sentence") and is
+         handed back to the caller.
+      5. If speech runs on for MAX_SEGMENT_SECONDS without ever pausing
+         that long, the segment is force-closed anyway, so one very long
+         run-on sentence can't grow the recording forever.
     """
 
     def __init__(self):
-        """Starts with an empty buffer and no segment in progress."""
-        self._vad = webrtcvad.Vad(VAD_AGGRESSIVENESS)
-        self._pending_bytes = bytearray()
-        self._segment_frames = bytearray()
-        self._in_speech = False
-        self._silence_seconds = 0.0
-        self._segment_seconds = 0.0
+        """Starts with nothing recorded yet and no segment in progress."""
+        self._speech_detector = webrtcvad.Vad(SPEECH_DETECTION_STRICTNESS)
+        # Audio that has arrived but hasn't been sliced into a full frame yet.
+        self._unsliced_audio = bytearray()
+        # Audio recorded for the segment currently in progress, if any.
+        self._current_segment_audio = bytearray()
+        self._segment_is_open = False
+        self._seconds_of_silence_in_a_row = 0.0
+        self._seconds_recorded_in_current_segment = 0.0
 
-    def add_audio(self, pcm_bytes):
+    def add_audio(self, audio_bytes):
         """
-        Feeds newly-arrived 16kHz mono PCM bytes into the segmenter, one
-        30ms VAD frame at a time.
+        Feeds newly-arrived 16kHz mono audio into the segmenter.
 
-        Returns:
-            list[bytes]: zero or more completed speech segments, each ready
-            to hand to Whisper.
-        """
-        self._pending_bytes.extend(pcm_bytes)
-        completed_segments = []
-        while len(self._pending_bytes) >= VAD_FRAME_BYTES:
-            frame = bytes(self._pending_bytes[:VAD_FRAME_BYTES])
-            del self._pending_bytes[:VAD_FRAME_BYTES]
-            segment = self._process_frame(frame)
-            if segment is not None:
-                completed_segments.append(segment)
-        return completed_segments
-
-    def _process_frame(self, frame):
-        """
-        Runs VAD on one 30ms frame and updates the in-progress segment,
-        closing it if a silence gap or the max-length cutoff is reached.
+        The speech detector can only judge one fixed-size 30ms slice of
+        audio at a time, but audio arrives in whatever size chunks the
+        network happens to deliver. So this keeps a small leftover buffer,
+        cuts off exactly one 30ms slice at a time as enough audio piles
+        up, and checks each slice in turn.
 
         Returns:
-            bytes | None: the completed segment, or None if still open.
+            list[bytes]: zero or more segments that finished (closed)
+            while processing this batch of audio, each ready to hand to
+            Whisper. Usually empty — most calls just add to an
+            open segment without finishing it.
         """
-        is_speech = self._vad.is_speech(frame, TARGET_SAMPLE_RATE)
-        if not is_speech and not self._in_speech:
+        self._unsliced_audio.extend(audio_bytes)
+
+        finished_segments = []
+        while len(self._unsliced_audio) >= BYTES_PER_FRAME:
+            one_frame = bytes(self._unsliced_audio[:BYTES_PER_FRAME])
+            del self._unsliced_audio[:BYTES_PER_FRAME]
+            finished_segment = self._add_frame_to_current_segment(one_frame)
+            if finished_segment is not None:
+                finished_segments.append(finished_segment)
+
+        return finished_segments
+
+    def _add_frame_to_current_segment(self, frame):
+        """
+        Asks the speech detector whether this one 30ms slice contains
+        speech, then updates the segment currently being recorded (if
+        any). Called once per slice, in order, by add_audio().
+
+        Returns:
+            bytes | None: the finished segment, if this slice was the one
+            that closed it. None if the segment is still open, or if
+            there's no segment in progress and this slice was silence.
+        """
+        this_frame_is_speech = self._speech_detector.is_speech(frame, TARGET_SAMPLE_RATE)
+
+        if not this_frame_is_speech and not self._segment_is_open:
+            # Plain silence and nothing recording yet — nothing to do.
             return None
 
-        self._segment_frames.extend(frame)
-        self._segment_seconds += VAD_FRAME_MS / 1000
+        self._current_segment_audio.extend(frame)
+        self._seconds_recorded_in_current_segment += FRAME_DURATION_SECONDS
 
-        if is_speech:
-            self._in_speech = True
-            self._silence_seconds = 0.0
+        if this_frame_is_speech:
+            self._segment_is_open = True
+            self._seconds_of_silence_in_a_row = 0.0
         else:
-            self._silence_seconds += VAD_FRAME_MS / 1000
-            if self._silence_seconds >= SILENCE_CLOSE_SECONDS:
-                return self._close_segment()
+            self._seconds_of_silence_in_a_row += FRAME_DURATION_SECONDS
+            if self._seconds_of_silence_in_a_row >= SILENCE_SECONDS_TO_CLOSE_SEGMENT:
+                return self._close_current_segment()
 
-        if self._segment_seconds >= MAX_SEGMENT_SECONDS:
-            return self._close_segment()
+        if self._seconds_recorded_in_current_segment >= MAX_SEGMENT_SECONDS:
+            return self._close_current_segment()
 
         return None
 
-    def _close_segment(self):
-        """Finalizes and returns the current segment, resetting state for the next one."""
-        segment = bytes(self._segment_frames)
-        self._segment_frames = bytearray()
-        self._in_speech = False
-        self._silence_seconds = 0.0
-        self._segment_seconds = 0.0
-        return segment
+    def _close_current_segment(self):
+        """
+        Packages up everything recorded for the current segment so it can
+        be handed off for transcription, then resets so the next speech
+        heard starts a brand new segment.
+
+        Returns:
+            bytes: the finished segment's audio.
+        """
+        finished_segment_audio = bytes(self._current_segment_audio)
+        self._current_segment_audio = bytearray()
+        self._segment_is_open = False
+        self._seconds_of_silence_in_a_row = 0.0
+        self._seconds_recorded_in_current_segment = 0.0
+        return finished_segment_audio
 
 
 def load_whisper_model():
@@ -190,19 +242,19 @@ def load_whisper_model():
     return model
 
 
-def pcm_to_whisper_input(pcm_bytes):
+def prepare_audio_for_whisper(audio_bytes):
     """
-    Converts 16-bit PCM bytes into the normalized float32 numpy array
-    faster-whisper expects as input.
+    Converts audio bytes into the number format faster-whisper expects to
+    read them in directly.
 
     Returns:
-        numpy.ndarray: mono float32 samples in the range [-1.0, 1.0].
+        numpy.ndarray: mono samples in the range [-1.0, 1.0].
     """
-    int16_samples = numpy.frombuffer(pcm_bytes, dtype=numpy.int16)
+    int16_samples = numpy.frombuffer(audio_bytes, dtype=numpy.int16)
     return int16_samples.astype(numpy.float32) / 32768.0
 
 
-def transcribe_pcm(model, pcm_bytes):
+def transcribe_audio(model, audio_bytes):
     """
     Runs Whisper on one closed speech segment. This is blocking, CPU-bound
     work — always call it through asyncio.to_thread(), never directly on
@@ -211,20 +263,20 @@ def transcribe_pcm(model, pcm_bytes):
     Returns:
         str: the transcribed text, stripped of leading/trailing whitespace.
     """
-    audio = pcm_to_whisper_input(pcm_bytes)
+    audio = prepare_audio_for_whisper(audio_bytes)
     segments, _ = model.transcribe(audio, language="en")
     return " ".join(segment.text.strip() for segment in segments).strip()
 
 
-async def transcribe_and_log(model, pcm_bytes):
+async def transcribe_and_log(model, audio_bytes):
     """
     Transcribes one closed speech segment in a background thread (keeping
     the event loop free to keep reading incoming audio_chunk messages) and
     logs the result with a timestamp.
     """
-    duration_seconds = len(pcm_bytes) / 2 / TARGET_SAMPLE_RATE
+    duration_seconds = len(audio_bytes) / 2 / TARGET_SAMPLE_RATE
     started_at = time.monotonic()
-    text = await asyncio.to_thread(transcribe_pcm, model, pcm_bytes)
+    text = await asyncio.to_thread(transcribe_audio, model, audio_bytes)
     elapsed_seconds = time.monotonic() - started_at
     timestamp = time.strftime("%H:%M:%S")
     spoken_text = text if text else "(no speech detected)"
@@ -271,17 +323,17 @@ class AudioLevelTracker:
 def handle_audio_chunk(model, tracker, segmenter, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
-    one-second stats, and feeds it (resampled to 16kHz mono) into the VAD
-    segmenter. Any speech segment the segmenter just closed is handed off
-    for background transcription.
+    one-second stats, and feeds it (converted to the common 16kHz mono
+    format) into the VAD segmenter. Any speech segment the segmenter just
+    closed is handed off for background transcription.
     """
     samples = decode_audio_chunk(message)
     if samples is None:
         return
     tracker.record(samples)
 
-    pcm_bytes = resample_to_16k_mono_pcm(samples, message["sample_rate"], message["channels"])
-    for segment in segmenter.add_audio(pcm_bytes):
+    audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
+    for segment in segmenter.add_audio(audio_bytes):
         asyncio.create_task(transcribe_and_log(model, segment))
 
 
