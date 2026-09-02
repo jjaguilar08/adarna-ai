@@ -12,6 +12,8 @@ from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -41,6 +43,21 @@ CHUNK_SECONDS = 0.1
 # one.
 HOTKEY_COMBINATION = "<ctrl>+<alt>+<space>"
 
+# Settings panel choices, sent to wsl_app as settings_changed when a session
+# starts. Keys are what's shown in the Mode dropdown; values are the wire
+# protocol's mode strings.
+MODE_LABELS_TO_VALUES = {
+    "Work Meeting": "meeting",
+    "Interview": "interview",
+}
+
+WHISPER_MODEL_SIZES = ["small.en", "base.en"]
+
+SUGGESTION_PAUSE_PRESETS_SECONDS = [0.8, 1.2, 1.6, 2.0]
+# Picked from the presets list itself (rather than a separate literal) so
+# it can never drift out of sync with it -- 1.2s matches Day 7's default.
+DEFAULT_SUGGESTION_PAUSE_SECONDS = SUGGESTION_PAUSE_PRESETS_SECONDS[1]
+
 
 def load_port():
     """
@@ -62,11 +79,12 @@ class WslConnection(QObject):
     socket, guarded by a lock so writes never interleave. See wsl_app/main.py
     for the full set of message types this protocol carries: ping/pong,
     audio_chunk, session_started/session_stopped, hotkey_triggered,
-    transcript, and suggestion.
+    settings_changed, transcript, and suggestion.
     """
 
     connection_changed = Signal(bool)
     transcript_received = Signal(str)
+    suggestion_received = Signal(str)
 
     def __init__(self):
         """Sets up the (initially disconnected) state shared across threads."""
@@ -118,9 +136,8 @@ class WslConnection(QObject):
         Reads incoming messages from wsl_app one line at a time for as
         long as the connection stays open, dispatching each by its "type".
         Pongs are just the ping heartbeat's reply (nothing to do);
-        transcripts are forwarded to transcript_received for the UI to
-        display; suggestions are just printed for now — there's no
-        dedicated suggestions UI pane yet (that's a later day's job).
+        transcripts and suggestions are forwarded to their own signal for
+        the UI to display.
         """
         while True:
             line = self._connection.readline()
@@ -130,7 +147,7 @@ class WslConnection(QObject):
             if message.get("type") == "transcript":
                 self.transcript_received.emit(message["text"])
             elif message.get("type") == "suggestion":
-                print(f"Suggestion: {message['text']}")
+                self.suggestion_received.emit(message["text"])
 
     def send_message(self, message):
         """
@@ -273,8 +290,18 @@ class AudioCaptureManager(QObject):
                     }
                 )
         finally:
-            stream.stop_stream()
-            stream.close()
+            # A stream that already failed (e.g. the WASAPI "Unanticipated
+            # host error" seen after long captures) can raise again here on
+            # teardown. Without this try/except, that second exception would
+            # stop capture_thread_finished from ever being emitted, leaving
+            # AudioCaptureManager stuck believing capture is still running.
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception as error:
+                # Deliberately broad: whatever this raises must not prevent
+                # the emit below from running.
+                print(f"Error while closing audio stream (ignoring, already unusable): {error}")
             self.capture_thread_finished.emit()
 
 
@@ -373,16 +400,122 @@ def create_session_buttons(layout):
 
 def create_transcript_pane(layout):
     """
-    Adds a scrolling, read-only pane that displays each transcript as it
-    arrives from wsl_app.
+    Adds a labeled, scrolling, read-only pane that displays each transcript
+    as it arrives from wsl_app.
 
     Returns:
         QPlainTextEdit: the pane to append new transcript text to.
     """
+    layout.addWidget(QLabel("Transcript"))
     pane = QPlainTextEdit()
     pane.setReadOnly(True)
     layout.addWidget(pane)
     return pane
+
+
+class LatestSuggestion(QObject):
+    """
+    Remembers the most recently received suggestion text, so the "Copy
+    Latest Suggestion" button can read it without needing its own
+    connection to wsl_app. A QObject (not a plain class) specifically so
+    that connecting suggestion_received.update to it is a proper
+    cross-thread queued connection, same as every other signal in this
+    file that crosses from a background thread to the GUI thread — a plain
+    object would make Qt call update() directly on WslConnection's
+    background reader thread instead.
+    """
+
+    def __init__(self):
+        """Starts with no suggestion received yet."""
+        super().__init__()
+        self.text = ""
+
+    def update(self, text):
+        """Stores `text` as the latest suggestion."""
+        self.text = text
+
+
+def create_suggestions_section(layout):
+    """
+    Adds a labeled, scrolling, read-only pane that displays each suggestion
+    as it arrives from wsl_app, plus a "Copy Latest Suggestion" button that
+    copies whatever the pane most recently displayed to the system
+    clipboard.
+
+    Returns:
+        tuple[QPlainTextEdit, LatestSuggestion]: the pane to append new
+        suggestion text to, and the tracker the Copy button reads from —
+        the caller should also connect this to whatever emits new
+        suggestion text (see main()).
+    """
+    layout.addWidget(QLabel("Suggestions"))
+    pane = QPlainTextEdit()
+    pane.setReadOnly(True)
+    layout.addWidget(pane)
+
+    latest_suggestion = LatestSuggestion()
+
+    def copy_latest_suggestion():
+        """Copies the most recently received suggestion text to the clipboard."""
+        if latest_suggestion.text:
+            QApplication.clipboard().setText(latest_suggestion.text)
+
+    copy_button = QPushButton("Copy Latest Suggestion")
+    copy_button.clicked.connect(copy_latest_suggestion)
+    layout.addWidget(copy_button)
+
+    return pane, latest_suggestion
+
+
+def create_settings_panel(layout):
+    """
+    Adds a labeled settings panel with the mode, Whisper model size, and
+    suggestion pause delay controls used to configure the next session.
+    These values are only read (and sent to wsl_app) when Start Session is
+    pressed — see create_session_controls() — so changing them mid-session
+    has no effect until the next session starts.
+
+    Returns:
+        tuple[QComboBox, QComboBox, QComboBox]: the mode, Whisper model
+        size, and suggestion pause dropdowns, in that order.
+    """
+    group = QGroupBox("Session Settings")
+    form = QFormLayout(group)
+
+    mode_dropdown = QComboBox()
+    for label in MODE_LABELS_TO_VALUES:
+        mode_dropdown.addItem(label)
+    form.addRow("Mode:", mode_dropdown)
+
+    whisper_model_dropdown = QComboBox()
+    for size in WHISPER_MODEL_SIZES:
+        whisper_model_dropdown.addItem(size)
+    form.addRow("Whisper model:", whisper_model_dropdown)
+
+    pause_dropdown = QComboBox()
+    for seconds in SUGGESTION_PAUSE_PRESETS_SECONDS:
+        pause_dropdown.addItem(f"{seconds}s", userData=seconds)
+    pause_dropdown.setCurrentIndex(SUGGESTION_PAUSE_PRESETS_SECONDS.index(DEFAULT_SUGGESTION_PAUSE_SECONDS))
+    form.addRow("Suggestion pause:", pause_dropdown)
+
+    layout.addWidget(group)
+    return mode_dropdown, whisper_model_dropdown, pause_dropdown
+
+
+def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown):
+    """
+    Reads the settings panel's current values and packages them into the
+    settings_changed message to send wsl_app.
+
+    Returns:
+        dict: the settings_changed message.
+    """
+    return {
+        "type": "settings_changed",
+        "mode": MODE_LABELS_TO_VALUES[mode_dropdown.currentText()],
+        "whisper_model_size": whisper_model_dropdown.currentText(),
+        "suggestion_pause_seconds": pause_dropdown.currentData(),
+    }
 
 
 def list_loopback_devices(audio):
@@ -403,6 +536,17 @@ def populate_device_dropdown(dropdown, devices, default_device):
         (i for i, device in enumerate(devices) if device["index"] == default_device["index"]), 0
     )
     dropdown.setCurrentIndex(default_index)
+
+
+def connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion):
+    """
+    Wires wsl_app's incoming transcript/suggestion messages to the UI: each
+    one is appended to its pane as it arrives, and latest_suggestion is
+    kept in sync so the Copy button always has something current to copy.
+    """
+    wsl_connection.transcript_received.connect(transcript_pane.appendPlainText)
+    wsl_connection.suggestion_received.connect(suggestions_pane.appendPlainText)
+    wsl_connection.suggestion_received.connect(latest_suggestion.update)
 
 
 def start_wsl_connection(status_label):
@@ -463,17 +607,23 @@ def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default
     return capture_manager
 
 
-def create_session_controls(wsl_connection, capture_manager, layout):
+def create_session_controls(
+    wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout
+):
     """
     Adds the Start Session / Stop Session buttons and wires them up:
-    starting sends session_started to wsl_app and starts audio capture;
-    stopping sends session_stopped and stops it. Button enabled-state
-    tracks which action is currently valid.
+    starting sends the settings panel's current values as settings_changed,
+    then session_started, to wsl_app, and starts audio capture; stopping
+    sends session_stopped and stops it. Button enabled-state tracks which
+    action is currently valid.
     """
     start_button, stop_button = create_session_buttons(layout)
 
     def start_session():
-        """Begins a session: notifies wsl_app, starts capture, and flips button state."""
+        """Begins a session: sends the current settings, notifies wsl_app, starts capture, and flips button state."""
+        wsl_connection.send_message(
+            current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown)
+        )
         wsl_connection.send_message({"type": "session_started"})
         capture_manager.start_capture()
         start_button.setEnabled(False)
@@ -494,8 +644,8 @@ def main():
     """
     Entry point: creates the app and window, starts the background
     connection to wsl_app, wires up WASAPI loopback audio capture, the
-    session start/stop controls, and the global suggestion hotkey, and
-    runs the event loop until the window is closed.
+    settings panel, the session start/stop controls, and the global
+    suggestion hotkey, and runs the event loop until the window is closed.
     """
     app = create_app()
     window = create_window()
@@ -503,7 +653,9 @@ def main():
     status_label = create_connection_status_label(layout)
     device_dropdown = create_device_dropdown(layout)
     capture_status_label = create_capture_status_label(layout)
+    mode_dropdown, whisper_model_dropdown, pause_dropdown = create_settings_panel(layout)
     transcript_pane = create_transcript_pane(layout)
+    suggestions_pane, latest_suggestion = create_suggestions_section(layout)
 
     audio = pyaudio.PyAudio()
     devices = list_loopback_devices(audio)
@@ -511,11 +663,13 @@ def main():
     populate_device_dropdown(device_dropdown, devices, default_device)
 
     wsl_connection = start_wsl_connection(status_label)
-    wsl_connection.transcript_received.connect(transcript_pane.appendPlainText)
+    connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion)
     capture_manager = create_audio_capture_manager(
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
     )
-    create_session_controls(wsl_connection, capture_manager, layout)
+    create_session_controls(
+        wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout
+    )
     # Kept referenced for the app's lifetime -- see start_global_hotkey()'s docstring.
     hotkey_listener = start_global_hotkey(wsl_connection)
 

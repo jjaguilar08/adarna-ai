@@ -48,10 +48,15 @@ MAX_SEGMENT_SECONDS = 20.0
 # full model call for nothing.
 MIN_SEGMENT_SECONDS_TO_TRANSCRIBE = 0.3
 
-WHISPER_MODEL_NAME = "small.en"
+# Whisper model size and assistant mode to use for a session that starts
+# before windows_app has ever sent a settings_changed message.
+DEFAULT_WHISPER_MODEL_SIZE = "small.en"
+DEFAULT_MODE = "meeting"
 
 # How long a pause has to last, with no further new transcript segment
-# arriving during it, before a suggestion is generated automatically.
+# arriving during it, before a suggestion is generated automatically —
+# used as the default until a session-specific value arrives via
+# settings_changed.
 PAUSE_SECONDS_BEFORE_SUGGESTION = 1.2
 
 # How many recent transcript segments are kept and sent as context with
@@ -75,9 +80,10 @@ def load_port():
 
 
 # Every message is one JSON object with a "type" field, newline-delimited.
-# "ping" / "pong" and "audio_chunk" are handled today. Coming in later days:
-# "transcript", "suggestion", "hotkey", and "mode_change" — routed here the
-# same way once they show up.
+# session_started/session_stopped, audio_chunk, hotkey_triggered, and
+# settings_changed are all one-way messages handled directly in
+# handle_client() below since they don't need a reply. This function only
+# covers the ones that do (currently just ping/pong).
 async def build_reply(message):
     """
     Decides how to respond to one incoming message, based on its "type".
@@ -261,19 +267,48 @@ class VoiceSegmenter:
         return self._close_current_segment()
 
 
-def load_whisper_model():
+def load_whisper_model(model_size):
     """
-    Loads the faster-whisper model once at startup. Loading takes a few
+    Loads a faster-whisper model of the given size. Loading takes a few
     seconds (and may download model weights on first run), so this must
-    never be called per-segment.
+    never be called per-segment — see WhisperModelManager, which calls this
+    only at startup and when a session asks for a different size.
 
     Returns:
         faster_whisper.WhisperModel: the loaded model, ready to transcribe.
     """
-    print(f"Loading Whisper model ({WHISPER_MODEL_NAME})... first run may download weights from Hugging Face.")
-    model = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8")
+    print(f"Loading Whisper model ({model_size})... first run may download weights from Hugging Face.")
+    model = WhisperModel(model_size, device="cpu", compute_type="int8")
     print("Whisper model loaded.")
     return model
+
+
+class WhisperModelManager:
+    """
+    Owns the one Whisper model currently loaded and shared by whichever
+    session is active. A session's chosen model size only takes effect at
+    session_started (see handle_client) — ensure_model_size() reloads the
+    model then, but only if the requested size actually differs from what's
+    already loaded, so starting several sessions in a row with the same
+    setting doesn't pay the multi-second reload cost each time.
+    """
+
+    def __init__(self):
+        """Loads the default-size model right away, so it's ready before the first session."""
+        self.model_size = DEFAULT_WHISPER_MODEL_SIZE
+        self.model = load_whisper_model(self.model_size)
+
+    async def ensure_model_size(self, requested_model_size):
+        """
+        Reloads the model if `requested_model_size` differs from what's
+        currently loaded. Runs the (blocking) load in a background thread
+        so it doesn't stall the server while it happens.
+        """
+        if requested_model_size == self.model_size:
+            return
+        print(f"Reloading Whisper model: {self.model_size} -> {requested_model_size}")
+        self.model = await asyncio.to_thread(load_whisper_model, requested_model_size)
+        self.model_size = requested_model_size
 
 
 def prepare_audio_for_whisper(audio_bytes):
@@ -400,13 +435,16 @@ class AudioLevelTracker:
             self._peak_amplitude = 0.0
 
 
-def handle_audio_chunk(model, tracker, session, message):
+def handle_audio_chunk(tracker, session, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
     one-second stats, and feeds it (converted to the common 16kHz mono
     format) into the session's speech segmenter. Any speech segment just
     closed is handed off to handle_finished_segment() along with the
     session, so a finished transcript can feed the suggestion trigger.
+    Transcribes with whichever Whisper model this session was started with
+    (session.model) — never the manager's current model directly, since
+    that could have moved on to a different size for a later session.
     """
     samples = decode_audio_chunk(message)
     if samples is None:
@@ -415,10 +453,42 @@ def handle_audio_chunk(model, tracker, session, message):
 
     audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
     for segment in session.segmenter.add_audio(audio_bytes):
-        handle_finished_segment(model, session.writer, segment, session)
+        handle_finished_segment(session.model, session.writer, segment, session)
 
 
-async def handle_client(model, reader, writer):
+def default_settings():
+    """
+    Returns:
+        dict: the settings to start a session with if it begins before any
+        settings_changed message has ever arrived on this connection.
+    """
+    return {
+        "mode": DEFAULT_MODE,
+        "whisper_model_size": DEFAULT_WHISPER_MODEL_SIZE,
+        "suggestion_pause_seconds": PAUSE_SECONDS_BEFORE_SUGGESTION,
+    }
+
+
+def settings_from_message(message):
+    """
+    Reads mode/whisper_model_size/suggestion_pause_seconds out of a
+    settings_changed message, falling back to default_settings() for any
+    field that's missing OR explicitly sent as null (a plain message.get(
+    key, default) wouldn't catch the null case, since the key would still
+    be present).
+
+    Returns:
+        dict: settings in the same shape default_settings() returns.
+    """
+    defaults = default_settings()
+    settings = {}
+    for key, default_value in defaults.items():
+        value = message.get(key)
+        settings[key] = value if value is not None else default_value
+    return settings
+
+
+async def handle_client(model_manager, reader, writer):
     """
     Services one connected windows_app client for the lifetime of the
     connection: reads newline-delimited JSON messages, replies to pings,
@@ -429,20 +499,25 @@ async def handle_client(model, reader, writer):
     messages from windows_app. audio_chunk and hotkey_triggered messages
     are only processed while a session is active — either arriving outside
     a session is ignored (defensive: windows_app should only be sending
-    them during a session anyway). Starting a session creates a fresh
+    them during a session anyway). settings_changed just remembers the
+    values it carries (pending_settings) for whichever session starts
+    next — windows_app sends it once, right before session_started, every
+    time Start Session is pressed, so it's never applied to an
+    already-running session. Starting a session creates a fresh
     MeetingSession (fresh speech segmenter, fresh claude CLI process, empty
-    transcript context), so no state bleeds across sessions; stopping one
-    force-closes whatever segment is still open so a sentence finished
-    right before stopping isn't silently dropped, then tears the session
-    down. If the connection itself drops mid-session (no explicit
-    session_stopped), the `finally` block below still tears it down, so the
-    claude CLI process it started is never left running with nothing using
-    it.
+    transcript context) using those settings, so no state bleeds across
+    sessions; stopping one force-closes whatever segment is still open so a
+    sentence finished right before stopping isn't silently dropped, then
+    tears the session down. If the connection itself drops mid-session (no
+    explicit session_stopped), the `finally` block below still tears it
+    down, so the claude CLI process it started is never left running with
+    nothing using it.
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
     audio_tracker = AudioLevelTracker()
     session = None
+    pending_settings = None
     try:
         while True:
             line = await reader.readline()
@@ -452,23 +527,33 @@ async def handle_client(model, reader, writer):
             message_type = message.get("type")
 
             if message_type == "session_started":
-                session = MeetingSession(writer)
-                print("Session started")
+                settings = pending_settings or default_settings()
+                await model_manager.ensure_model_size(settings["whisper_model_size"])
+                session = MeetingSession(
+                    writer, model_manager.model, settings["mode"], settings["suggestion_pause_seconds"]
+                )
+                print(
+                    f"Session started (mode={settings['mode']}, "
+                    f"whisper_model={settings['whisper_model_size']}, "
+                    f"suggestion_pause={settings['suggestion_pause_seconds']}s)"
+                )
             elif message_type == "session_stopped":
                 if session is not None:
                     leftover_audio = session.segmenter.close_open_segment()
                     if leftover_audio is not None:
-                        handle_finished_segment(model, session.writer, leftover_audio)
+                        handle_finished_segment(session.model, session.writer, leftover_audio)
                     await session.close()
                     session = None
                 print("Session stopped")
             elif message_type == "audio_chunk":
                 if session is not None:
-                    handle_audio_chunk(model, audio_tracker, session, message)
+                    handle_audio_chunk(audio_tracker, session, message)
             elif message_type == "hotkey_triggered":
                 if session is not None:
                     print("Hotkey pressed: generating a suggestion now")
                     session.trigger.notify_hotkey_pressed()
+            elif message_type == "settings_changed":
+                pending_settings = settings_from_message(message)
             else:
                 reply = await build_reply(message)
                 if reply is not None:
@@ -481,7 +566,7 @@ async def handle_client(model, reader, writer):
         await writer.wait_closed()
 
 
-async def run_server(model):
+async def run_server(model_manager):
     """
     Starts the asyncio TCP server on localhost and serves clients until stopped.
     """
@@ -489,7 +574,7 @@ async def run_server(model):
 
     async def handle_client_connection(reader, writer):
         """Adapts handle_client to asyncio.start_server's (reader, writer) callback shape."""
-        await handle_client(model, reader, writer)
+        await handle_client(model_manager, reader, writer)
 
     server = await asyncio.start_server(handle_client_connection, "127.0.0.1", port)
     print(f"wsl_app listening on 127.0.0.1:{port}")
@@ -497,18 +582,34 @@ async def run_server(model):
         await server.serve_forever()
 
 
-# The framing given to every prompt sent through ClaudeCli. Hardcoded for now;
-# switching this based on interview vs. meeting mode is a later day's job.
-# The last sentence was added after Day 6 testing showed the model answering
-# with multiple options and meta-commentary ("Here's a natural way to
-# continue: ... Or shorter/more neutral: ...") instead of one line someone
-# could actually say out loud.
-CLAUDE_CLI_SYSTEM_PROMPT = (
+# The framing given to every prompt sent through a session's ClaudeCli,
+# chosen per session by mode (see MeetingSession). Both end with the same
+# instruction, added after Day 6 testing showed the model answering with
+# multiple options and meta-commentary ("Here's a natural way to continue:
+# ... Or shorter/more neutral: ...") instead of one line someone could
+# actually say out loud.
+RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION = (
+    "Respond with only the single line you'd say out loud — no options, no "
+    "meta-commentary, no explanation."
+)
+
+MEETING_SYSTEM_PROMPT = (
     "You are assisting the user live during a work meeting. Given a snippet "
     "of recent conversation, suggest a brief, natural response they could "
-    "say next. Respond with only the single line you'd say out loud — no "
-    "options, no meta-commentary, no explanation."
+    "say next. " + RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION
 )
+
+INTERVIEW_SYSTEM_PROMPT = (
+    "You are assisting the user live during a job interview, in which the "
+    "user is the candidate being interviewed. Given a snippet of the "
+    "interviewer's most recent question or remark, suggest a brief, "
+    "confident answer the user could give next. " + RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION
+)
+
+SYSTEM_PROMPT_BY_MODE = {
+    "meeting": MEETING_SYSTEM_PROMPT,
+    "interview": INTERVIEW_SYSTEM_PROMPT,
+}
 
 
 class ClaudeCli:
@@ -528,8 +629,8 @@ class ClaudeCli:
     to try this class out on its own, outside the live pipeline.
     """
 
-    def __init__(self):
-        """Starts the claude command-line process running in the background, ready for prompts."""
+    def __init__(self, system_prompt):
+        """Starts the claude command-line process running in the background, framed by `system_prompt`, ready for prompts."""
         self._process = subprocess.Popen(
             [
                 "claude",
@@ -537,7 +638,7 @@ class ClaudeCli:
                 "--input-format", "stream-json",
                 "--output-format", "stream-json",
                 "--verbose",
-                "--system-prompt", CLAUDE_CLI_SYSTEM_PROMPT,
+                "--system-prompt", system_prompt,
                 "--tools", "",
             ],
             stdin=subprocess.PIPE,
@@ -605,8 +706,8 @@ class SuggestionTrigger:
       1. Every time a new transcribed segment comes in (notify_new_segment),
          the pause timer (re)starts from zero, and this segment is
          remembered as "new since the last suggestion."
-      2. If the pause timer ever finishes — meaning PAUSE_SECONDS_BEFORE_SUGGESTION
-         passed with no further new segment — a suggestion is generated,
+      2. If the pause timer ever finishes — meaning its configured pause
+         duration passed with no further new segment — a suggestion is generated,
          but only if step 1 happened at least once since the last
          suggestion. This is what stops a long stretch of silence with
          nothing new said from generating a suggestion over and over.
@@ -617,12 +718,14 @@ class SuggestionTrigger:
          said, won't immediately fire again for the same content.
     """
 
-    def __init__(self, generate_suggestion):
+    def __init__(self, generate_suggestion, pause_seconds):
         """
-        Stores the async function to call when the trigger fires. Starts
-        idle: no segment seen yet, no pause timer running.
+        Stores the async function to call when the trigger fires, and how
+        long the pause timer (step 2 above) should wait. Starts idle: no
+        segment seen yet, no pause timer running.
         """
         self._generate_suggestion = generate_suggestion
+        self._pause_seconds = pause_seconds
         self._new_segment_since_last_suggestion = False
         self._pause_timer_task = None
 
@@ -650,7 +753,7 @@ class SuggestionTrigger:
 
     async def _wait_then_fire(self):
         """Waits out the pause duration, then fires. See class docstring, step 2."""
-        await asyncio.sleep(PAUSE_SECONDS_BEFORE_SUGGESTION)
+        await asyncio.sleep(self._pause_seconds)
         if not self._new_segment_since_last_suggestion:
             return
         self._new_segment_since_last_suggestion = False
@@ -667,13 +770,21 @@ class MeetingSession:
     give suggestions context.
     """
 
-    def __init__(self, writer):
-        """Starts a fresh session: new segmenter, new claude CLI process, empty transcript history, idle trigger."""
+    def __init__(self, writer, model, mode, pause_seconds):
+        """
+        Starts a fresh session using the settings captured for it at
+        session_started (see handle_client): new segmenter, `model` as the
+        Whisper model this session transcribes with for its entire
+        lifetime, a new claude CLI process framed for `mode`, empty
+        transcript history, and a suggestion trigger using `pause_seconds`.
+        """
         self.writer = writer
+        self.model = model
         self.segmenter = VoiceSegmenter()
         self.recent_transcript_segments = []
-        print("Starting claude CLI process for this session...")
-        self._claude_cli = ClaudeCli()
+        self._system_prompt = SYSTEM_PROMPT_BY_MODE.get(mode, MEETING_SYSTEM_PROMPT)
+        print(f"Starting claude CLI process for this session (mode: {mode})...")
+        self._claude_cli = ClaudeCli(self._system_prompt)
         self._ask_call_count = 0
         # Guards every use of self._claude_cli's ask()/stop(): only one of
         # those may run at a time, since the CLI process has no way to tell
@@ -681,7 +792,7 @@ class MeetingSession:
         # and close() must never stop the process while an ask() started by
         # the pause timer or the hotkey is still using it.
         self._claude_cli_lock = asyncio.Lock()
-        self.trigger = SuggestionTrigger(self._generate_and_send_suggestion)
+        self.trigger = SuggestionTrigger(self._generate_and_send_suggestion, pause_seconds)
 
     def add_transcript_segment(self, text):
         """
@@ -736,7 +847,7 @@ class MeetingSession:
             return
         print("Recycling claude CLI process for this session (reached call limit)")
         await asyncio.to_thread(self._claude_cli.stop)
-        self._claude_cli = ClaudeCli()
+        self._claude_cli = ClaudeCli(self._system_prompt)
         self._ask_call_count = 0
 
     async def close(self):
@@ -753,10 +864,10 @@ class MeetingSession:
 
 def main():
     """
-    Entry point: loads the Whisper model, then runs the IPC server until interrupted.
+    Entry point: loads the default Whisper model, then runs the IPC server until interrupted.
     """
-    model = load_whisper_model()
-    asyncio.run(run_server(model))
+    model_manager = WhisperModelManager()
+    asyncio.run(run_server(model_manager))
 
 
 if __name__ == "__main__":

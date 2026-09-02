@@ -4,7 +4,7 @@ wsl_app server — run this file directly: python test_claude_cli.py
 """
 import time
 
-from main import ClaudeCli
+from main import MEETING_SYSTEM_PROMPT, ClaudeCli
 
 # Real transcript excerpts from Day 4 manual testing (see project_notes.md),
 # not invented text.
@@ -24,7 +24,7 @@ def send_example_prompts_and_report():
     starting a new one per prompt) is that later calls should be
     meaningfully faster than the first.
     """
-    claude_cli = ClaudeCli()
+    claude_cli = ClaudeCli(MEETING_SYSTEM_PROMPT)
     seconds_taken = []
 
     for excerpt in TRANSCRIPT_EXCERPTS:
