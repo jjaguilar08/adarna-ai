@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QVBoxLayout,
@@ -78,13 +79,14 @@ class WslConnection(QObject):
     other background threads (audio capture) send messages over the same
     socket, guarded by a lock so writes never interleave. See wsl_app/main.py
     for the full set of message types this protocol carries: ping/pong,
-    audio_chunk, session_started/session_stopped, hotkey_triggered,
-    settings_changed, transcript, and suggestion.
+    audio_chunk, session_started/session_stopped, session_start_failed,
+    hotkey_triggered, settings_changed, transcript, and suggestion.
     """
 
     connection_changed = Signal(bool)
     transcript_received = Signal(str)
     suggestion_received = Signal(str)
+    session_start_failed_received = Signal(str, int)
 
     def __init__(self):
         """Sets up the (initially disconnected) state shared across threads."""
@@ -137,7 +139,12 @@ class WslConnection(QObject):
         long as the connection stays open, dispatching each by its "type".
         Pongs are just the ping heartbeat's reply (nothing to do);
         transcripts and suggestions are forwarded to their own signal for
-        the UI to display.
+        the UI to display; session_start_failed is forwarded so the UI can
+        revert out of the "session active" state it optimistically entered
+        when Start Session was pressed — its attempt_id is the same value
+        sent on the session_started message it's responding to, echoed back
+        so the UI can tell a stale failure (for an attempt already
+        abandoned in favor of a newer one) from a current one.
         """
         while True:
             line = self._connection.readline()
@@ -148,6 +155,10 @@ class WslConnection(QObject):
                 self.transcript_received.emit(message["text"])
             elif message.get("type") == "suggestion":
                 self.suggestion_received.emit(message["text"])
+            elif message.get("type") == "session_start_failed":
+                self.session_start_failed_received.emit(
+                    message.get("reason", "Unknown error"), message.get("attempt_id", -1)
+                )
 
     def send_message(self, message):
         """
@@ -185,10 +196,19 @@ class AudioCaptureManager(QObject):
     signal — the same cross-thread signal pattern WslConnection uses for
     connection_changed — so the UI updates only once capture has actually
     stopped, without freezing while it waits.
+
+    If the stream itself fails mid-capture (e.g. the Windows audio device
+    was unplugged or changed), that's different from a requested stop: the
+    session is still running on the wsl_app side with nothing left feeding
+    it audio. capture_thread_finished's bool tells the caller which case
+    happened; capture_failed is emitted (on the GUI thread) only for the
+    unrequested-failure case, so a caller can end the whole session rather
+    than just updating the capture status label.
     """
 
     status_changed = Signal(str)
-    capture_thread_finished = Signal()
+    capture_thread_finished = Signal(bool)
+    capture_failed = Signal()
 
     def __init__(self, audio, wsl_connection):
         """Stores the shared PyAudio instance and the connection to send chunks over."""
@@ -232,12 +252,17 @@ class AudioCaptureManager(QObject):
         self._device_to_start_after_stop = None
         self._stop_event.set()
 
-    def handle_capture_thread_finished(self):
+    def handle_capture_thread_finished(self, stream_failed):
         """
         Runs on the GUI thread once a capture thread has fully closed its
-        stream. Clears the finished thread's state, then either starts a
-        fresh thread on a newly-selected device (if set_device() was
-        called mid-capture) or reports that capture is stopped.
+        stream. Clears the finished thread's state, then: restarts on a
+        newly-selected device if set_device() was called mid-capture — even
+        if the old stream also failed around the same time, since the user
+        is already leaving that device, so the switch should win rather
+        than reporting a failure for a device they're abandoning anyway;
+        otherwise reports the failure via capture_failed if the stream
+        broke on its own; otherwise reports that capture is stopped
+        normally.
         """
         self._thread = None
         self._stop_event = None
@@ -246,6 +271,9 @@ class AudioCaptureManager(QObject):
         if device is not None:
             self._device = device
             self._begin_capture_thread(device)
+        elif stream_failed:
+            self.status_changed.emit("Not capturing (device error)")
+            self.capture_failed.emit()
         else:
             self.status_changed.emit("Not capturing")
 
@@ -259,9 +287,12 @@ class AudioCaptureManager(QObject):
     def _capture_loop(self, device, stop_event):
         """
         Reads small blocks of audio from `device` and sends each one as an
-        audio_chunk message, until `stop_event` is set. Emits
-        capture_thread_finished once the stream is fully closed, so the
-        GUI thread can safely react to the thread being done.
+        audio_chunk message, until `stop_event` is set or reading the
+        stream itself fails (e.g. the device was unplugged or changed).
+        Emits capture_thread_finished once the stream is fully closed, so
+        the GUI thread can safely react to the thread being done — its bool
+        argument tells the caller whether this was a real failure rather
+        than a requested stop.
         """
         rate = int(device["defaultSampleRate"])
         channels = device["maxInputChannels"]
@@ -274,9 +305,15 @@ class AudioCaptureManager(QObject):
             input_device_index=device["index"],
             frames_per_buffer=chunk_frames,
         )
+        stream_failed = False
         try:
             while not stop_event.is_set():
-                data = stream.read(chunk_frames, exception_on_overflow=False)
+                try:
+                    data = stream.read(chunk_frames, exception_on_overflow=False)
+                except Exception as error:
+                    print(f"Audio capture stream failed, stopping: {error}")
+                    stream_failed = True
+                    break
                 self._wsl_connection.send_message(
                     {
                         "type": "audio_chunk",
@@ -302,7 +339,7 @@ class AudioCaptureManager(QObject):
                 # Deliberately broad: whatever this raises must not prevent
                 # the emit below from running.
                 print(f"Error while closing audio stream (ignoring, already unusable): {error}")
-            self.capture_thread_finished.emit()
+            self.capture_thread_finished.emit(stream_failed)
 
 
 def create_app():
@@ -608,36 +645,112 @@ def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default
 
 
 def create_session_controls(
-    wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout
+    wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout, window
 ):
     """
     Adds the Start Session / Stop Session buttons and wires them up:
     starting sends the settings panel's current values as settings_changed,
-    then session_started, to wsl_app, and starts audio capture; stopping
-    sends session_stopped and stops it. Button enabled-state tracks which
-    action is currently valid.
+    then session_started (tagged with a fresh attempt_id — see
+    handle_session_start_failed), and starts audio capture; stopping sends
+    session_stopped and stops it. Button enabled-state tracks which action
+    is currently valid.
+
+    Also handles three ways a session can end itself, all reverting to the
+    same clean pre-session UI state stop_session() reaches (see
+    end_session()): wsl_app reporting it couldn't start the session at all
+    (session_start_failed — e.g. a Whisper model reload failure), the
+    wsl_app connection dropping mid-session, and the local audio capture
+    stream itself failing mid-session (e.g. the Windows audio device
+    disappeared or changed).
     """
     start_button, stop_button = create_session_buttons(layout)
+    current_attempt_id = 0
+
+    def revert_to_pre_session_state():
+        """Resets the Start/Stop buttons to look like no session is running."""
+        start_button.setEnabled(True)
+        stop_button.setEnabled(False)
+
+    def end_session(notify_wsl_app, capture_already_stopped):
+        """
+        Shared teardown for every way a session can end — an explicit Stop
+        Session click, wsl_app failing to start one, the wsl_app connection
+        dropping, or the capture stream failing — so each caller only has
+        to say which parts of that teardown it still needs to do:
+        notify_wsl_app is False when wsl_app already knows the session
+        isn't running (it never started one, or the connection to it is
+        already dead); capture_already_stopped is True when the capture
+        thread has already finished on its own (a stream failure) rather
+        than needing to be told to stop.
+        """
+        if notify_wsl_app:
+            wsl_connection.send_message({"type": "session_stopped"})
+        if not capture_already_stopped:
+            capture_manager.stop_capture()
+        revert_to_pre_session_state()
 
     def start_session():
         """Begins a session: sends the current settings, notifies wsl_app, starts capture, and flips button state."""
+        nonlocal current_attempt_id
+        current_attempt_id += 1
         wsl_connection.send_message(
             current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown)
         )
-        wsl_connection.send_message({"type": "session_started"})
+        wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
         capture_manager.start_capture()
         start_button.setEnabled(False)
         stop_button.setEnabled(True)
 
     def stop_session():
-        """Ends a session: notifies wsl_app, stops capture, and flips button state."""
-        wsl_connection.send_message({"type": "session_stopped"})
-        capture_manager.stop_capture()
-        start_button.setEnabled(True)
-        stop_button.setEnabled(False)
+        """Ends a session the user explicitly asked to stop."""
+        end_session(notify_wsl_app=True, capture_already_stopped=False)
+
+    def handle_session_start_failed(reason, attempt_id):
+        """
+        wsl_app couldn't start the session it was just asked to (e.g. a
+        Whisper model reload failed). Ignored unless attempt_id matches the
+        most recent Start Session click: wsl_app processes messages on one
+        connection strictly in order, so if the user hits Stop and then
+        Start again before this (slow) failure response for an earlier,
+        already-abandoned attempt arrives, reverting now would incorrectly
+        tear down the newer session that's actually running rather than the
+        old one this failure is actually about.
+        """
+        if attempt_id != current_attempt_id:
+            return
+        end_session(notify_wsl_app=False, capture_already_stopped=False)
+        QMessageBox.warning(window, "Session Failed to Start", reason)
+
+    def handle_connection_changed(connected):
+        """
+        If a session was active when the wsl_app connection drops (not at
+        session_started — see handle_session_start_failed for that case),
+        ends the session the same way Stop Session would, instead of
+        leaving capture running against a dead socket. Ignored while no
+        session is active (including every reconnect attempt before the
+        first successful connection).
+        """
+        if connected or not stop_button.isEnabled():
+            return
+        end_session(notify_wsl_app=False, capture_already_stopped=False)
+
+    def handle_capture_failed():
+        """
+        The local audio capture stream itself failed mid-session (e.g. the
+        Windows audio device disappeared or changed) — ends the session the
+        same way Stop Session would, since wsl_app would otherwise be left
+        waiting for audio that's never coming. Capture has already stopped
+        by the time this fires.
+        """
+        if not stop_button.isEnabled():
+            return
+        end_session(notify_wsl_app=True, capture_already_stopped=True)
 
     start_button.clicked.connect(start_session)
     stop_button.clicked.connect(stop_session)
+    wsl_connection.session_start_failed_received.connect(handle_session_start_failed)
+    wsl_connection.connection_changed.connect(handle_connection_changed)
+    capture_manager.capture_failed.connect(handle_capture_failed)
 
 
 def main():
@@ -668,7 +781,7 @@ def main():
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
     )
     create_session_controls(
-        wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout
+        wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout, window
     )
     # Kept referenced for the app's lifetime -- see start_global_hotkey()'s docstring.
     hotkey_listener = start_global_hotkey(wsl_connection)

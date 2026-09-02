@@ -10,6 +10,7 @@ import json
 import subprocess
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import numpy
@@ -348,10 +349,22 @@ def segment_duration_seconds(audio_bytes):
 
 async def send_message(writer, message):
     """
-    Writes one JSON message to a connected windows_app client.
+    Writes one JSON message to a connected windows_app client. windows_app
+    can disconnect while a segment is still transcribing or a suggestion is
+    still being generated — a real, expected race, not a bug — in which
+    case the write fails with a connection error. That's logged and
+    swallowed here (the single place every outgoing message passes through)
+    rather than left to blow up as an unhandled background-task exception,
+    since the rest of the session may still be running fine for reasons
+    unrelated to this one message.
     """
-    writer.write((json.dumps(message) + "\n").encode())
-    await writer.drain()
+    try:
+        writer.write((json.dumps(message) + "\n").encode())
+        await writer.drain()
+    except OSError as error:
+        # Covers ConnectionResetError/BrokenPipeError, which is what a
+        # disconnected client actually raises here.
+        print(f"Couldn't send {message.get('type')!r} to client (already disconnected?): {error}")
 
 
 async def transcribe_segment_and_report(model, writer, audio_bytes, session=None):
@@ -512,6 +525,12 @@ async def handle_client(model_manager, reader, writer):
     explicit session_stopped), the `finally` block below still tears it
     down, so the claude CLI process it started is never left running with
     nothing using it.
+
+    If starting a session fails (e.g. the requested Whisper model size
+    can't load), no MeetingSession is created and a session_start_failed
+    message is sent back instead of just dropping the connection, so
+    windows_app can revert its UI to a clean pre-session state rather than
+    getting stuck showing a session as active.
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
@@ -528,15 +547,26 @@ async def handle_client(model_manager, reader, writer):
 
             if message_type == "session_started":
                 settings = pending_settings or default_settings()
-                await model_manager.ensure_model_size(settings["whisper_model_size"])
-                session = MeetingSession(
-                    writer, model_manager.model, settings["mode"], settings["suggestion_pause_seconds"]
-                )
-                print(
-                    f"Session started (mode={settings['mode']}, "
-                    f"whisper_model={settings['whisper_model_size']}, "
-                    f"suggestion_pause={settings['suggestion_pause_seconds']}s)"
-                )
+                attempt_id = message.get("attempt_id")
+                try:
+                    await model_manager.ensure_model_size(settings["whisper_model_size"])
+                    new_session = MeetingSession(
+                        writer, model_manager.model, settings["mode"], settings["suggestion_pause_seconds"]
+                    )
+                except Exception as error:
+                    print(f"Failed to start session: {error}")
+                    traceback.print_exc()
+                    await send_message(
+                        writer,
+                        {"type": "session_start_failed", "reason": str(error), "attempt_id": attempt_id},
+                    )
+                else:
+                    session = new_session
+                    print(
+                        f"Session started (mode={settings['mode']}, "
+                        f"whisper_model={settings['whisper_model_size']}, "
+                        f"suggestion_pause={settings['suggestion_pause_seconds']}s)"
+                    )
             elif message_type == "session_stopped":
                 if session is not None:
                     leftover_audio = session.segmenter.close_open_segment()
@@ -666,12 +696,22 @@ class ClaudeCli:
         for its complete answer. Safe to call more than once on the same
         ClaudeCli — each call continues the same ongoing conversation.
 
+        Raises:
+            RuntimeError: if the claude process has crashed — either its
+            stdin is already closed (can't send the prompt at all) or it
+            exits before sending back a complete answer. Callers that want
+            to survive a crash (see MeetingSession) should catch this and
+            create a fresh ClaudeCli.
+
         Returns:
             str: the answer text.
         """
         input_line = {"type": "user", "message": {"role": "user", "content": prompt_text}}
-        self._process.stdin.write(json.dumps(input_line) + "\n")
-        self._process.stdin.flush()
+        try:
+            self._process.stdin.write(json.dumps(input_line) + "\n")
+            self._process.stdin.flush()
+        except (BrokenPipeError, ValueError) as error:
+            raise RuntimeError("claude CLI process is not running") from error
         return self._read_next_answer()
 
     def _read_next_answer(self):
@@ -767,7 +807,10 @@ class MeetingSession:
     each time and cleanly torn down together: speech segmentation, the
     running claude CLI process behind it, the pause/hotkey suggestion
     trigger, and a short rolling history of recent transcript segments to
-    give suggestions context.
+    give suggestions context. If the claude CLI process crashes mid-session,
+    one restart is attempted automatically (see _ask_with_restart_on_crash)
+    — recent_transcript_segments lives here, not in ClaudeCli, so a restart
+    doesn't lose the transcript context built up so far.
     """
 
     def __init__(self, writer, model, mode, pause_seconds):
@@ -819,6 +862,12 @@ class MeetingSession:
         this method, and running two ask() calls on the same claude CLI
         process at once would have no way to tell which answer belongs to
         which request.
+
+        If the claude CLI process has crashed, one restart is attempted
+        (see _ask_with_restart_on_crash) before giving up on this
+        particular suggestion — the transcript context this session has
+        built up lives in recent_transcript_segments, not in ClaudeCli, so
+        a restart doesn't lose anything and the next trigger can try again.
         """
         if self._claude_cli_lock.locked():
             return
@@ -826,11 +875,64 @@ class MeetingSession:
             prompt_text = " ".join(self.recent_transcript_segments)
             if not prompt_text:
                 return
-            suggestion_text = await asyncio.to_thread(self._claude_cli.ask, prompt_text)
+            suggestion_text = await self._ask_with_restart_on_crash(prompt_text)
+            if suggestion_text is None:
+                return
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] Suggestion: {suggestion_text}")
             await send_message(self.writer, {"type": "suggestion", "text": suggestion_text})
             await self._count_ask_call_and_recycle_if_due()
+
+    async def _ask_with_restart_on_crash(self, prompt_text):
+        """
+        Sends prompt_text to this session's claude CLI process. If the
+        process has crashed (ClaudeCli.ask() raises RuntimeError), restarts
+        it once and retries the same prompt on the fresh process, so one
+        crashed process doesn't end the whole meeting session. If even
+        restarting the process itself fails (e.g. the claude command can't
+        be spawned right now), that's logged and treated the same as a
+        still-failing process — this suggestion is skipped rather than
+        letting the error escape as an unhandled background-task exception.
+
+        Returns:
+            str | None: the answer text, or None if the process couldn't be
+            used even after one restart attempt (this suggestion is
+            skipped, but the session keeps running and the next trigger
+            tries again).
+        """
+        for attempt in (1, 2):
+            try:
+                return await asyncio.to_thread(self._claude_cli.ask, prompt_text)
+            except RuntimeError as error:
+                if attempt == 2:
+                    print(f"claude CLI still failing after restart, skipping this suggestion: {error}")
+                    return None
+                print(f"claude CLI process crashed ({error}); restarting and retrying once")
+                try:
+                    await self._restart_claude_cli()
+                except Exception as restart_error:
+                    print(f"Couldn't restart claude CLI process, skipping this suggestion: {restart_error}")
+                    return None
+        return None
+
+    async def _restart_claude_cli(self):
+        """
+        Replaces this session's claude CLI process with a fresh one, framed
+        with the same system prompt, and resets the call-count used to
+        decide when the next routine recycle is due (a freshly-started
+        process, whether from crash recovery or a routine recycle, hasn't
+        made any calls yet either way). Used both for the normal call-count
+        recycling and for recovering from a crashed process.
+        """
+        try:
+            await asyncio.to_thread(self._claude_cli.stop)
+        except Exception as error:
+            # The old process is already dead or misbehaving — nothing to
+            # do about that, and it must not stop the fresh one from
+            # starting.
+            print(f"Error stopping crashed claude CLI process (ignoring): {error}")
+        self._claude_cli = ClaudeCli(self._system_prompt)
+        self._ask_call_count = 0
 
     async def _count_ask_call_and_recycle_if_due(self):
         """
@@ -846,9 +948,7 @@ class MeetingSession:
         if self._ask_call_count < ASK_CALLS_BEFORE_RECYCLING_CLAUDE_CLI:
             return
         print("Recycling claude CLI process for this session (reached call limit)")
-        await asyncio.to_thread(self._claude_cli.stop)
-        self._claude_cli = ClaudeCli(self._system_prompt)
-        self._ask_call_count = 0
+        await self._restart_claude_cli()
 
     async def close(self):
         """
