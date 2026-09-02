@@ -756,6 +756,17 @@ class SuggestionTrigger:
          as a suggestion having just been generated (same bookkeeping as
          step 2) — so a normal pause right afterward, with nothing new
          said, won't immediately fire again for the same content.
+
+    Once stopped, permanently ignores both notify_new_segment() and
+    notify_hotkey_pressed() — not just the pause timer that happened to be
+    running at the moment of stop(). This matters because a segment that
+    was already mid-transcription when the session's connection dropped
+    can still call notify_new_segment() *after* stop() has already run (see
+    MeetingSession.close()); without this, that late call would start a
+    brand new pause timer, which would go on to generate a suggestion (and
+    spawn a fresh claude CLI process to do it) for a session that no longer
+    has anywhere to send it — an orphaned process with nothing left to stop
+    it.
     """
 
     def __init__(self, generate_suggestion, pause_seconds):
@@ -768,21 +779,32 @@ class SuggestionTrigger:
         self._pause_seconds = pause_seconds
         self._new_segment_since_last_suggestion = False
         self._pause_timer_task = None
+        self._stopped = False
 
     def notify_new_segment(self):
-        """Call once for every newly-transcribed segment. See class docstring, step 1."""
+        """Call once for every newly-transcribed segment. See class docstring, step 1. A no-op once stopped."""
+        if self._stopped:
+            return
         self._new_segment_since_last_suggestion = True
         self._cancel_pause_timer()
         self._pause_timer_task = asyncio.create_task(self._wait_then_fire())
 
     def notify_hotkey_pressed(self):
-        """Call when windows_app reports the hotkey was pressed. See class docstring, step 3."""
+        """Call when windows_app reports the hotkey was pressed. See class docstring, step 3. A no-op once stopped."""
+        if self._stopped:
+            return
         self._cancel_pause_timer()
         self._new_segment_since_last_suggestion = False
         asyncio.create_task(self._generate_suggestion())
 
     def stop(self):
-        """Cancels any pause timer in flight. Call when the session ends, so it can't fire after teardown."""
+        """
+        Cancels any pause timer in flight and permanently disables future
+        triggers. Call when the session ends, so nothing — including a
+        transcript segment that finishes after this call — can fire a
+        suggestion for it again.
+        """
+        self._stopped = True
         self._cancel_pause_timer()
 
     def _cancel_pause_timer(self):
