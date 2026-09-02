@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 import pyaudiowpatch as pyaudio
+from pynput import keyboard
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication,
@@ -24,6 +25,21 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 PING_INTERVAL_SECONDS = 2
 RECONNECT_DELAY_SECONDS = 2
 CHUNK_SECONDS = 0.1
+
+# Placeholder combination for the "generate a suggestion now" global
+# hotkey; making this configurable is a later concern. Must work even
+# while windows_app doesn't have focus (the user will be focused on their
+# meeting app), which is why this uses pynput's system-wide hook rather
+# than a plain Qt shortcut (Qt shortcuts only fire while their own window
+# is focused).
+#
+# Chose pynput over the `keyboard` package for this: neither library's own
+# documentation states a Windows administrator requirement (`keyboard`'s
+# docs only call out needing root on Linux), and pynput's GlobalHotKeys is
+# the more actively-maintained, purpose-built API for exactly this. See
+# project_notes.md (Day 7) for the empirical testing done before picking
+# one.
+HOTKEY_COMBINATION = "<ctrl>+<alt>+<space>"
 
 
 def load_port():
@@ -45,7 +61,8 @@ class WslConnection(QObject):
     other background threads (audio capture) send messages over the same
     socket, guarded by a lock so writes never interleave. See wsl_app/main.py
     for the full set of message types this protocol carries: ping/pong,
-    audio_chunk, session_started/session_stopped, and transcript.
+    audio_chunk, session_started/session_stopped, hotkey_triggered,
+    transcript, and suggestion.
     """
 
     connection_changed = Signal(bool)
@@ -102,7 +119,8 @@ class WslConnection(QObject):
         long as the connection stays open, dispatching each by its "type".
         Pongs are just the ping heartbeat's reply (nothing to do);
         transcripts are forwarded to transcript_received for the UI to
-        display.
+        display; suggestions are just printed for now — there's no
+        dedicated suggestions UI pane yet (that's a later day's job).
         """
         while True:
             line = self._connection.readline()
@@ -111,6 +129,8 @@ class WslConnection(QObject):
             message = json.loads(line)
             if message.get("type") == "transcript":
                 self.transcript_received.emit(message["text"])
+            elif message.get("type") == "suggestion":
+                print(f"Suggestion: {message['text']}")
 
     def send_message(self, message):
         """
@@ -401,6 +421,28 @@ def start_wsl_connection(status_label):
     return wsl_connection
 
 
+def start_global_hotkey(wsl_connection):
+    """
+    Registers the global "generate a suggestion now" hotkey (see
+    HOTKEY_COMBINATION) and sends wsl_app a hotkey_triggered message
+    whenever it's pressed. wsl_app decides whether to actually act on it
+    (it's ignored there if no session is running).
+
+    Returns:
+        pynput.keyboard.GlobalHotKeys: the running hotkey listener. Must be
+        kept referenced by the caller for as long as the app runs, or it
+        would be garbage-collected and stop listening.
+    """
+
+    def notify_wsl_app_hotkey_was_pressed():
+        """Sends wsl_app the hotkey_triggered message."""
+        wsl_connection.send_message({"type": "hotkey_triggered"})
+
+    hotkey_listener = keyboard.GlobalHotKeys({HOTKEY_COMBINATION: notify_wsl_app_hotkey_was_pressed})
+    hotkey_listener.start()
+    return hotkey_listener
+
+
 def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default_device, capture_status_label):
     """
     Creates the audio capture manager: preselects the default device,
@@ -451,9 +493,9 @@ def create_session_controls(wsl_connection, capture_manager, layout):
 def main():
     """
     Entry point: creates the app and window, starts the background
-    connection to wsl_app, wires up WASAPI loopback audio capture and the
-    session start/stop controls, and runs the event loop until the window
-    is closed.
+    connection to wsl_app, wires up WASAPI loopback audio capture, the
+    session start/stop controls, and the global suggestion hotkey, and
+    runs the event loop until the window is closed.
     """
     app = create_app()
     window = create_window()
@@ -474,6 +516,8 @@ def main():
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
     )
     create_session_controls(wsl_connection, capture_manager, layout)
+    # Kept referenced for the app's lifetime -- see start_global_hotkey()'s docstring.
+    hotkey_listener = start_global_hotkey(wsl_connection)
 
     window.show()
     sys.exit(app.exec())

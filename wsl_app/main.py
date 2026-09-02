@@ -50,6 +50,17 @@ MIN_SEGMENT_SECONDS_TO_TRANSCRIBE = 0.3
 
 WHISPER_MODEL_NAME = "small.en"
 
+# How long a pause has to last, with no further new transcript segment
+# arriving during it, before a suggestion is generated automatically.
+PAUSE_SECONDS_BEFORE_SUGGESTION = 1.2
+
+# How many recent transcript segments are kept and sent as context with
+# each suggestion request, and how many ask() calls a session's claude CLI
+# process handles before being recycled (stopped and restarted fresh) to
+# bound its own automatically-growing internal conversation history.
+SEGMENTS_TO_KEEP_FOR_CONTEXT = 10
+ASK_CALLS_BEFORE_RECYCLING_CLAUDE_CLI = 10
+
 
 def load_port():
     """
@@ -308,12 +319,18 @@ async def send_message(writer, message):
     await writer.drain()
 
 
-async def transcribe_segment_and_report(model, writer, audio_bytes):
+async def transcribe_segment_and_report(model, writer, audio_bytes, session=None):
     """
     Transcribes one closed speech segment in a background thread (keeping
     the event loop free to keep reading incoming messages), logs the
     result with a timestamp, and — if it contains real text — sends it to
-    windows_app as a transcript message.
+    windows_app as a transcript message. If this segment belongs to a
+    still-active session, also feeds the text into that session's rolling
+    context and suggestion trigger (see MeetingSession). `session` is left
+    as None for a segment transcribed after its session has already ended
+    (the trailing bit of audio flushed on session_stopped), so it's
+    reported but doesn't try to trigger a suggestion from a session that no
+    longer exists.
     """
     duration_seconds = segment_duration_seconds(audio_bytes)
     started_at = time.monotonic()
@@ -329,21 +346,24 @@ async def transcribe_segment_and_report(model, writer, audio_bytes):
         await send_message(
             writer, {"type": "transcript", "text": text, "duration_seconds": duration_seconds}
         )
+        if session is not None:
+            session.add_transcript_segment(text)
 
 
-def handle_finished_segment(model, writer, audio_bytes):
+def handle_finished_segment(model, writer, audio_bytes, session=None):
     """
     Decides what to do with one just-closed speech segment: skip
     transcription entirely if it's too short to plausibly be real speech
     (a false positive from the speech detector that would otherwise cost a
     full, slow model call for nothing), or kick off background
-    transcription-and-reporting otherwise.
+    transcription-and-reporting otherwise. `session` is passed through to
+    transcribe_segment_and_report() — see its docstring.
     """
     duration_seconds = segment_duration_seconds(audio_bytes)
     if duration_seconds < MIN_SEGMENT_SECONDS_TO_TRANSCRIBE:
         print(f"Skipping {duration_seconds:.2f}s segment: below minimum duration, likely not real speech")
         return
-    asyncio.create_task(transcribe_segment_and_report(model, writer, audio_bytes))
+    asyncio.create_task(transcribe_segment_and_report(model, writer, audio_bytes, session))
 
 
 class AudioLevelTracker:
@@ -380,12 +400,13 @@ class AudioLevelTracker:
             self._peak_amplitude = 0.0
 
 
-def handle_audio_chunk(model, tracker, segmenter, writer, message):
+def handle_audio_chunk(model, tracker, session, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
     one-second stats, and feeds it (converted to the common 16kHz mono
-    format) into the speech segmenter. Any speech segment the segmenter
-    just closed is handed off to handle_finished_segment().
+    format) into the session's speech segmenter. Any speech segment just
+    closed is handed off to handle_finished_segment() along with the
+    session, so a finished transcript can feed the suggestion trigger.
     """
     samples = decode_audio_chunk(message)
     if samples is None:
@@ -393,8 +414,8 @@ def handle_audio_chunk(model, tracker, segmenter, writer, message):
     tracker.record(samples)
 
     audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
-    for segment in segmenter.add_audio(audio_bytes):
-        handle_finished_segment(model, writer, segment)
+    for segment in session.segmenter.add_audio(audio_bytes):
+        handle_finished_segment(model, session.writer, segment, session)
 
 
 async def handle_client(model, reader, writer):
@@ -405,18 +426,23 @@ async def handle_client(model, reader, writer):
     segmentation/transcription.
 
     A "session" is bounded by explicit session_started/session_stopped
-    messages from windows_app. audio_chunk messages are only processed
-    while a session is active — one that arrives outside a session is
-    ignored (defensive: windows_app should only be capturing during a
-    session anyway). Starting a session creates a fresh VoiceSegmenter, so
-    buffered state never bleeds across sessions; stopping one force-closes
-    whatever segment is still open so a sentence finished right before
-    stopping isn't silently dropped.
+    messages from windows_app. audio_chunk and hotkey_triggered messages
+    are only processed while a session is active — either arriving outside
+    a session is ignored (defensive: windows_app should only be sending
+    them during a session anyway). Starting a session creates a fresh
+    MeetingSession (fresh speech segmenter, fresh claude CLI process, empty
+    transcript context), so no state bleeds across sessions; stopping one
+    force-closes whatever segment is still open so a sentence finished
+    right before stopping isn't silently dropped, then tears the session
+    down. If the connection itself drops mid-session (no explicit
+    session_stopped), the `finally` block below still tears it down, so the
+    claude CLI process it started is never left running with nothing using
+    it.
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
     audio_tracker = AudioLevelTracker()
-    session_segmenter = None
+    session = None
     try:
         while True:
             line = await reader.readline()
@@ -426,23 +452,30 @@ async def handle_client(model, reader, writer):
             message_type = message.get("type")
 
             if message_type == "session_started":
-                session_segmenter = VoiceSegmenter()
+                session = MeetingSession(writer)
                 print("Session started")
             elif message_type == "session_stopped":
-                if session_segmenter is not None:
-                    leftover_audio = session_segmenter.close_open_segment()
+                if session is not None:
+                    leftover_audio = session.segmenter.close_open_segment()
                     if leftover_audio is not None:
-                        handle_finished_segment(model, writer, leftover_audio)
-                    session_segmenter = None
+                        handle_finished_segment(model, session.writer, leftover_audio)
+                    await session.close()
+                    session = None
                 print("Session stopped")
             elif message_type == "audio_chunk":
-                if session_segmenter is not None:
-                    handle_audio_chunk(model, audio_tracker, session_segmenter, writer, message)
+                if session is not None:
+                    handle_audio_chunk(model, audio_tracker, session, message)
+            elif message_type == "hotkey_triggered":
+                if session is not None:
+                    print("Hotkey pressed: generating a suggestion now")
+                    session.trigger.notify_hotkey_pressed()
             else:
                 reply = await build_reply(message)
                 if reply is not None:
                     await send_message(writer, reply)
     finally:
+        if session is not None:
+            await session.close()
         print(f"Client disconnected: {peer}")
         writer.close()
         await writer.wait_closed()
@@ -466,10 +499,15 @@ async def run_server(model):
 
 # The framing given to every prompt sent through ClaudeCli. Hardcoded for now;
 # switching this based on interview vs. meeting mode is a later day's job.
+# The last sentence was added after Day 6 testing showed the model answering
+# with multiple options and meta-commentary ("Here's a natural way to
+# continue: ... Or shorter/more neutral: ...") instead of one line someone
+# could actually say out loud.
 CLAUDE_CLI_SYSTEM_PROMPT = (
     "You are assisting the user live during a work meeting. Given a snippet "
     "of recent conversation, suggest a brief, natural response they could "
-    "say next."
+    "say next. Respond with only the single line you'd say out loud — no "
+    "options, no meta-commentary, no explanation."
 )
 
 
@@ -484,9 +522,10 @@ class ClaudeCli:
     own, so later prompts can refer back to earlier ones without this class
     needing to resend the earlier conversation itself.
 
-    Not yet used by the live transcript pipeline (see wsl_app/test_claude_cli.py
-    for a standalone way to try it out) — wiring it into handle_client() so
-    suggestions actually reach windows_app is a later day's job.
+    Used by MeetingSession, one per active meeting session (see below) —
+    not shared across sessions, and not run until a session actually
+    starts. wsl_app/test_claude_cli.py is still there as a standalone way
+    to try this class out on its own, outside the live pipeline.
     """
 
     def __init__(self):
@@ -555,6 +594,161 @@ class ClaudeCli:
         """Shuts the claude process down cleanly and waits for it to exit."""
         self._process.stdin.close()
         self._process.wait()
+
+
+class SuggestionTrigger:
+    """
+    Decides when to ask claude for a new suggestion. Built on top of the
+    transcript segments already being produced, rather than watching raw
+    audio silence with a second, separate watcher:
+
+      1. Every time a new transcribed segment comes in (notify_new_segment),
+         the pause timer (re)starts from zero, and this segment is
+         remembered as "new since the last suggestion."
+      2. If the pause timer ever finishes — meaning PAUSE_SECONDS_BEFORE_SUGGESTION
+         passed with no further new segment — a suggestion is generated,
+         but only if step 1 happened at least once since the last
+         suggestion. This is what stops a long stretch of silence with
+         nothing new said from generating a suggestion over and over.
+      3. Pressing the hotkey (notify_hotkey_pressed) generates a suggestion
+         immediately, no matter what the pause timer is doing, and counts
+         as a suggestion having just been generated (same bookkeeping as
+         step 2) — so a normal pause right afterward, with nothing new
+         said, won't immediately fire again for the same content.
+    """
+
+    def __init__(self, generate_suggestion):
+        """
+        Stores the async function to call when the trigger fires. Starts
+        idle: no segment seen yet, no pause timer running.
+        """
+        self._generate_suggestion = generate_suggestion
+        self._new_segment_since_last_suggestion = False
+        self._pause_timer_task = None
+
+    def notify_new_segment(self):
+        """Call once for every newly-transcribed segment. See class docstring, step 1."""
+        self._new_segment_since_last_suggestion = True
+        self._cancel_pause_timer()
+        self._pause_timer_task = asyncio.create_task(self._wait_then_fire())
+
+    def notify_hotkey_pressed(self):
+        """Call when windows_app reports the hotkey was pressed. See class docstring, step 3."""
+        self._cancel_pause_timer()
+        self._new_segment_since_last_suggestion = False
+        asyncio.create_task(self._generate_suggestion())
+
+    def stop(self):
+        """Cancels any pause timer in flight. Call when the session ends, so it can't fire after teardown."""
+        self._cancel_pause_timer()
+
+    def _cancel_pause_timer(self):
+        """Stops the currently running pause timer, if one is running."""
+        if self._pause_timer_task is not None:
+            self._pause_timer_task.cancel()
+            self._pause_timer_task = None
+
+    async def _wait_then_fire(self):
+        """Waits out the pause duration, then fires. See class docstring, step 2."""
+        await asyncio.sleep(PAUSE_SECONDS_BEFORE_SUGGESTION)
+        if not self._new_segment_since_last_suggestion:
+            return
+        self._new_segment_since_last_suggestion = False
+        await self._generate_suggestion()
+
+
+class MeetingSession:
+    """
+    Everything that lives for the span of one meeting session — from
+    session_started to session_stopped — and needs to be created fresh
+    each time and cleanly torn down together: speech segmentation, the
+    running claude CLI process behind it, the pause/hotkey suggestion
+    trigger, and a short rolling history of recent transcript segments to
+    give suggestions context.
+    """
+
+    def __init__(self, writer):
+        """Starts a fresh session: new segmenter, new claude CLI process, empty transcript history, idle trigger."""
+        self.writer = writer
+        self.segmenter = VoiceSegmenter()
+        self.recent_transcript_segments = []
+        print("Starting claude CLI process for this session...")
+        self._claude_cli = ClaudeCli()
+        self._ask_call_count = 0
+        # Guards every use of self._claude_cli's ask()/stop(): only one of
+        # those may run at a time, since the CLI process has no way to tell
+        # two concurrent requests' answers apart on its shared stdin/stdout,
+        # and close() must never stop the process while an ask() started by
+        # the pause timer or the hotkey is still using it.
+        self._claude_cli_lock = asyncio.Lock()
+        self.trigger = SuggestionTrigger(self._generate_and_send_suggestion)
+
+    def add_transcript_segment(self, text):
+        """
+        Adds one newly-transcribed segment to the rolling context window,
+        dropping the oldest once there are more than
+        SEGMENTS_TO_KEEP_FOR_CONTEXT, and lets the suggestion trigger know
+        new content has arrived.
+        """
+        self.recent_transcript_segments.append(text)
+        if len(self.recent_transcript_segments) > SEGMENTS_TO_KEEP_FOR_CONTEXT:
+            self.recent_transcript_segments.pop(0)
+        self.trigger.notify_new_segment()
+
+    async def _generate_and_send_suggestion(self):
+        """
+        Asks claude for one suggestion based on the recent transcript
+        context and sends it to windows_app as a "suggestion" message. Runs
+        ask() on a background thread via asyncio.to_thread, since it blocks
+        on the subprocess and must not stall audio_chunk handling while a
+        suggestion is being generated.
+
+        Skipped (not queued) if a suggestion is already being generated —
+        the pause timer and the hotkey are two independent ways to reach
+        this method, and running two ask() calls on the same claude CLI
+        process at once would have no way to tell which answer belongs to
+        which request.
+        """
+        if self._claude_cli_lock.locked():
+            return
+        async with self._claude_cli_lock:
+            prompt_text = " ".join(self.recent_transcript_segments)
+            if not prompt_text:
+                return
+            suggestion_text = await asyncio.to_thread(self._claude_cli.ask, prompt_text)
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"[{timestamp}] Suggestion: {suggestion_text}")
+            await send_message(self.writer, {"type": "suggestion", "text": suggestion_text})
+            await self._count_ask_call_and_recycle_if_due()
+
+    async def _count_ask_call_and_recycle_if_due(self):
+        """
+        Counts one more completed ask() call, and recycles the claude CLI
+        process (stops it, then starts a fresh one) once
+        ASK_CALLS_BEFORE_RECYCLING_CLAUDE_CLI is reached, so a long
+        session's own internal conversation history doesn't grow the
+        subprocess forever. Runs stop() on a background thread since it
+        blocks waiting for the old process to exit, and this must not
+        stall the server while a session recycles.
+        """
+        self._ask_call_count += 1
+        if self._ask_call_count < ASK_CALLS_BEFORE_RECYCLING_CLAUDE_CLI:
+            return
+        print("Recycling claude CLI process for this session (reached call limit)")
+        await asyncio.to_thread(self._claude_cli.stop)
+        self._claude_cli = ClaudeCli()
+        self._ask_call_count = 0
+
+    async def close(self):
+        """
+        Ends the session: cancels any pending suggestion timer, waits for
+        any suggestion currently being generated to finish (so the claude
+        CLI process's stdin is never closed out from under an in-flight
+        ask()), then stops the process on a background thread.
+        """
+        self.trigger.stop()
+        async with self._claude_cli_lock:
+            await asyncio.to_thread(self._claude_cli.stop)
 
 
 def main():
