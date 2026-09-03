@@ -986,7 +986,7 @@ class MeetingSession:
             if not prompt_text:
                 return
             suggestion_text = await self._ask_with_restart_on_crash(prompt_text)
-            if suggestion_text is None:
+            if not suggestion_text or not suggestion_text.strip():
                 return
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] Suggestion: {suggestion_text}")
