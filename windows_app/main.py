@@ -571,14 +571,14 @@ class LatestSuggestion(QObject):
 
 def create_suggestions_section(layout):
     """
-    Adds a labeled, scrolling, read-only pane that displays each suggestion
-    as it arrives from wsl_app, plus a "Copy Latest Suggestion" button that
-    copies whatever the pane most recently displayed to the system
-    clipboard.
+    Adds a labeled, read-only pane that displays the latest suggestion from
+    wsl_app — a new one replaces whatever was shown before, rather than
+    appending to a growing list — plus a "Copy Latest Suggestion" button
+    that copies the pane's current text to the system clipboard.
 
     Returns:
-        tuple[QPlainTextEdit, LatestSuggestion]: the pane to append new
-        suggestion text to, and the tracker the Copy button reads from —
+        tuple[QPlainTextEdit, LatestSuggestion]: the pane to set new
+        suggestion text on, and the tracker the Copy button reads from —
         the caller should also connect this to whatever emits new
         suggestion text (see main()).
     """
@@ -728,11 +728,13 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
 def connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion):
     """
     Wires wsl_app's incoming transcript/suggestion messages to the UI: each
-    one is appended to its pane as it arrives, and latest_suggestion is
-    kept in sync so the Copy button always has something current to copy.
+    transcript segment is appended to the transcript pane, each suggestion
+    replaces whatever the suggestions pane currently shows, and
+    latest_suggestion is kept in sync so the Copy button always has
+    something current to copy.
     """
     wsl_connection.transcript_received.connect(transcript_pane.appendPlainText)
-    wsl_connection.suggestion_received.connect(suggestions_pane.appendPlainText)
+    wsl_connection.suggestion_received.connect(suggestions_pane.setPlainText)
     wsl_connection.suggestion_received.connect(latest_suggestion.update)
 
 

@@ -642,34 +642,31 @@ async def run_server(model_manager):
 # instruction. Originally (Day 6) this asked for a single ready-to-read
 # spoken line, after testing showed the model otherwise answering with
 # multiple options and meta-commentary ("Here's a natural way to continue:
-# ... Or shorter/more neutral: ..."). Changed (Phase 1.5, Day 12) after real
-# usage showed a full scripted line wasn't what was actually wanted live —
-# the user wants terms/concepts/key points to build their own answer from,
-# not a script to read verbatim.
-RESPOND_WITH_TERMS_INSTRUCTION = (
-    "Respond with only a short, comma-separated list of the key terms, "
-    "concepts, or points the user could build their own answer from — not "
-    "a full sentence or a script to read out loud, and not a structured "
-    "breakdown or bulleted essay either. Something glanceable in a couple "
-    "seconds during a live conversation, e.g. \"Encapsulation, Inheritance, "
-    "Polymorphism, Abstraction\" rather than a paragraph. At most 5-8 terms. "
-    "Add a clause of context after a term only if it's genuinely necessary "
-    "to disambiguate — a few words, not a sentence. No options, no "
-    "meta-commentary, no explanation, no markdown formatting."
+# ... Or shorter/more neutral: ..."). Changed (Phase 1.5, Day 12) to ask for
+# terms/concepts instead of a script, but that didn't hold up in real use —
+# reverted (Phase 1.5b, Day 13) back to a script, this time explicitly
+# longer than Day 6's original bare line so it actually carries substance.
+RESPOND_WITH_SCRIPT_INSTRUCTION = (
+    "Respond with a real, ready-to-say response of 2-4 sentences — enough "
+    "to carry actual substance and reasoning behind it, not just a single "
+    "terse line. Write it the way the user would actually say it out loud "
+    "in the moment: plain spoken language, no meta-commentary, no multiple "
+    "options, no markdown formatting, no bullet points or lists. Still "
+    "short enough to skim and say out loud in a few seconds — a real "
+    "answer, not an essay."
 )
 
 MEETING_SYSTEM_PROMPT = (
     "You are assisting the user live during a work meeting. Given a snippet "
-    "of recent conversation, suggest the key terms, concepts, or points "
-    "relevant to what's being discussed. " + RESPOND_WITH_TERMS_INSTRUCTION
+    "of recent conversation, suggest how the user could respond to what's "
+    "being discussed. " + RESPOND_WITH_SCRIPT_INSTRUCTION
 )
 
 INTERVIEW_SYSTEM_PROMPT = (
     "You are assisting the user live during a job interview, in which the "
     "user is the candidate being interviewed. Given a snippet of the "
-    "interviewer's most recent question or remark, suggest the key terms, "
-    "concepts, or points the user could use to build their own answer. "
-    + RESPOND_WITH_TERMS_INSTRUCTION
+    "interviewer's most recent question or remark, suggest how the user "
+    "could answer it. " + RESPOND_WITH_SCRIPT_INSTRUCTION
 )
 
 SYSTEM_PROMPT_BY_MODE = {
