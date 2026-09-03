@@ -1,5 +1,6 @@
 import base64
 import json
+import queue
 import socket
 import sys
 import threading
@@ -28,6 +29,25 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 PING_INTERVAL_SECONDS = 2
 RECONNECT_DELAY_SECONDS = 2
 CHUNK_SECONDS = 0.1
+
+# How long the capture loop waits for the next audio block before checking
+# whether it's been told to stop. Keeps Stop Session/a device switch
+# responsive even if the device stops delivering audio altogether -- see
+# _capture_loop()'s docstring for the bug this constant exists to prevent.
+CAPTURE_QUEUE_POLL_SECONDS = 0.5
+
+# How many captured-but-not-yet-sent audio blocks _capture_loop will hold
+# onto before it starts dropping the newest ones. At CHUNK_SECONDS-sized
+# blocks, this is a few seconds of buffering -- enough to ride out a brief
+# stall in sending (e.g. wsl_app briefly falling behind), without letting a
+# longer one (the multi-second CPU-contention stalls noted in PRD §9) grow
+# memory use without bound. The old stream.read()-based loop never needed
+# this: a stalled send() there meant the next read() simply didn't happen
+# yet, so audio piled up in the device driver's own bounded buffer instead
+# of in our process. Callback mode hands blocks over on a fixed schedule
+# regardless of whether anything is still keeping up, so this queue needs
+# its own bound to reproduce that same graceful-degradation behavior.
+MAX_QUEUED_AUDIO_BLOCKS = 50
 
 # Placeholder combination for the "generate a suggestion now" global
 # hotkey; making this configurable is a later concern. Must work even
@@ -286,34 +306,110 @@ class AudioCaptureManager(QObject):
 
     def _capture_loop(self, device, stop_event):
         """
-        Reads small blocks of audio from `device` and sends each one as an
-        audio_chunk message, until `stop_event` is set or reading the
-        stream itself fails (e.g. the device was unplugged or changed).
-        Emits capture_thread_finished once the stream is fully closed, so
-        the GUI thread can safely react to the thread being done — its bool
+        Captures audio from `device` and sends each block as an audio_chunk
+        message, until `stop_event` is set or the stream itself stops
+        unexpectedly (e.g. the device was unplugged or changed).
+
+        Uses pyaudiowpatch's non-blocking "callback" mode rather than
+        calling stream.read() in a loop on this thread. That used to be a
+        blocking loop guarded only by checking stop_event between reads --
+        but a blocked native read can't be interrupted from Python, and on
+        a flaky device (reproduced live on a Bluetooth loopback device,
+        where the driver just stopped delivering audio mid-capture)
+        stream.read() hung forever, so stop_event.set() did nothing and
+        Stop Session/device-switching became permanent no-ops. Verified
+        against the installed pyaudiowpatch that its blocking read() has no
+        timeout parameter to fall back on instead (see project_notes.md,
+        Day 11) -- the callback API is the one it actually supports for
+        this.
+
+        With callback mode, PortAudio invokes on_audio_block on its own
+        thread whenever a block is ready, and this thread never makes a
+        blocking call into the device at all -- it just waits on the queue
+        that callback feeds, re-checking stop_event every time that wait
+        times out. So a stop request is noticed within
+        CAPTURE_QUEUE_POLL_SECONDS no matter what the device is doing, even
+        if it has stopped delivering audio entirely. That queue is bounded
+        (MAX_QUEUED_AUDIO_BLOCKS) so a slow-to-send stretch degrades the
+        same way the old blocking loop did -- newest audio wins, oldest gets
+        dropped -- instead of growing memory use without bound.
+
+        A stream going quiet without ever calling on_audio_block again is
+        deliberately NOT treated as a failure on its own -- only
+        stream.is_active() going False is. An earlier version of this fix
+        also tried to infer failure from "no data for N seconds," but
+        testing live against a Logi USB headset (Day 11) showed that
+        device's WASAPI loopback delivers nothing at all -- not even
+        near-silent blocks -- during any silence, including a completely
+        normal pause between sentences in a real conversation, not just
+        before the first one. There's no reliable way from here to tell
+        "the device died" apart from "nobody's talking right now," so this
+        only acts on the signal PortAudio itself actually gives for that
+        (is_active() going False); the rest of the fix -- a stop request
+        always being noticed within CAPTURE_QUEUE_POLL_SECONDS -- already
+        closes the actual bug regardless.
+
+        Emits capture_thread_finished once the stream is fully closed (or,
+        if the stream couldn't even be opened, right away), so the GUI
+        thread can safely react to the thread being done — its bool
         argument tells the caller whether this was a real failure rather
         than a requested stop.
         """
         rate = int(device["defaultSampleRate"])
         channels = device["maxInputChannels"]
         chunk_frames = int(rate * CHUNK_SECONDS)
-        stream = self._audio.open(
-            format=pyaudio.paFloat32,
-            channels=channels,
-            rate=rate,
-            input=True,
-            input_device_index=device["index"],
-            frames_per_buffer=chunk_frames,
-        )
+        audio_blocks = queue.Queue(maxsize=MAX_QUEUED_AUDIO_BLOCKS)
+
+        def on_audio_block(in_data, frame_count, time_info, status_flags):
+            """
+            Runs on PortAudio's own thread: hands one captured block to the
+            queue and asks for more. If the queue is already full, makes
+            room by dropping the OLDEST queued block rather than this new
+            one -- a /code-review catch: dropping the incoming block instead
+            would keep sending increasingly stale audio for the entire
+            length of a stall and then permanently lose whatever was said
+            during it, the opposite of the graceful degradation
+            MAX_QUEUED_AUDIO_BLOCKS is meant to give.
+            """
+            try:
+                audio_blocks.put_nowait(in_data)
+            except queue.Full:
+                try:
+                    audio_blocks.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    audio_blocks.put_nowait(in_data)
+                except queue.Full:
+                    pass  # lost a race with the consumer thread; fine to just drop this one
+            return (None, pyaudio.paContinue)
+
+        try:
+            stream = self._audio.open(
+                format=pyaudio.paFloat32,
+                channels=channels,
+                rate=rate,
+                input=True,
+                input_device_index=device["index"],
+                frames_per_buffer=chunk_frames,
+                stream_callback=on_audio_block,
+            )
+        except Exception as error:
+            print(f"Could not open audio capture stream, stopping: {error}")
+            self.capture_thread_finished.emit(True)
+            return
+
         stream_failed = False
         try:
             while not stop_event.is_set():
                 try:
-                    data = stream.read(chunk_frames, exception_on_overflow=False)
-                except Exception as error:
-                    print(f"Audio capture stream failed, stopping: {error}")
-                    stream_failed = True
-                    break
+                    data = audio_blocks.get(timeout=CAPTURE_QUEUE_POLL_SECONDS)
+                except queue.Empty:
+                    if not stream.is_active():
+                        print("Audio capture stream is no longer active, stopping")
+                        stream_failed = True
+                        break
+                    continue
                 self._wsl_connection.send_message(
                     {
                         "type": "audio_chunk",
@@ -327,10 +423,9 @@ class AudioCaptureManager(QObject):
                     }
                 )
         finally:
-            # A stream that already failed (e.g. the WASAPI "Unanticipated
-            # host error" seen after long captures) can raise again here on
-            # teardown. Without this try/except, that second exception would
-            # stop capture_thread_finished from ever being emitted, leaving
+            # A stream that already failed can raise again here on teardown.
+            # Without this try/except, that second exception would stop
+            # capture_thread_finished from ever being emitted, leaving
             # AudioCaptureManager stuck believing capture is still running.
             try:
                 stream.stop_stream()
@@ -615,9 +710,44 @@ def start_global_hotkey(wsl_connection):
         would be garbage-collected and stop listening.
     """
 
+    # A single persistent worker sends every hotkey_triggered message, rather
+    # than pynput's listener thread sending it directly (see
+    # notify_wsl_app_hotkey_was_pressed() below for why) and rather than
+    # spawning a fresh thread per press. A /code-review catch: spawning a
+    # fresh thread per press is fine if send_message() returns quickly, but
+    # if wsl_app were ever genuinely hung without closing the socket,
+    # send_message()'s flush() could block indefinitely -- and a thread per
+    # press would then mean an unbounded pile of permanently stuck threads
+    # for as long as the user kept pressing the hotkey during the hang. One
+    # dedicated worker bounds that to a single stuck thread at most; the
+    # maxsize=1 queue means extra presses while a send is in flight are
+    # simply treated as duplicates of the same "generate a suggestion now"
+    # request rather than queuing up.
+    pending_hotkey_presses = queue.Queue(maxsize=1)
+
+    def send_hotkey_messages_to_wsl_app():
+        """Runs for the app's lifetime: sends one hotkey_triggered message to wsl_app each time notify_wsl_app_hotkey_was_pressed() records one."""
+        while True:
+            pending_hotkey_presses.get()
+            wsl_connection.send_message({"type": "hotkey_triggered"})
+
+    threading.Thread(target=send_hotkey_messages_to_wsl_app, daemon=True).start()
+
     def notify_wsl_app_hotkey_was_pressed():
-        """Sends wsl_app the hotkey_triggered message."""
-        wsl_connection.send_message({"type": "hotkey_triggered"})
+        """
+        Records that the hotkey was pressed, for send_hotkey_messages_to_wsl_app()
+        to actually send. Never sends directly from here: this runs on
+        pynput's own listener thread, which also pumps the low-level
+        keyboard hook Windows delivers every key event through, so anything
+        that blocks here would delay it from noticing the next key press for
+        as long as the block lasts -- and send_message() can itself block
+        briefly on the network socket if wsl_app falls behind reading it
+        (see project_notes.md, Day 11).
+        """
+        try:
+            pending_hotkey_presses.put_nowait(None)
+        except queue.Full:
+            pass  # a send is already pending; this press is a duplicate of that one
 
     hotkey_listener = keyboard.GlobalHotKeys({HOTKEY_COMBINATION: notify_wsl_app_hotkey_was_pressed})
     hotkey_listener.start()
