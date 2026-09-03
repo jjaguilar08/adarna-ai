@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -64,6 +64,12 @@ MAX_QUEUED_AUDIO_BLOCKS = 50
 # project_notes.md (Day 7) for the empirical testing done before picking
 # one.
 HOTKEY_COMBINATION = "<ctrl>+<alt>+<space>"
+
+# Global show/hide hotkey for the overlay window (see create_overlay_window()).
+# Deliberately a different combination from HOTKEY_COMBINATION above -- pynput's
+# GlobalHotKeys registers both from one shared listener (see start_global_hotkeys()),
+# and dispatches each independently, so the two don't interfere with each other.
+OVERLAY_HOTKEY_COMBINATION = "<ctrl>+<alt>+o"
 
 # Settings panel choices, sent to wsl_app as settings_changed when a session
 # starts. Keys are what's shown in the Mode dropdown; values are the wire
@@ -569,6 +575,79 @@ class LatestSuggestion(QObject):
         self.text = text
 
 
+class OverlayToggle(QObject):
+    """
+    Lets the global show/hide hotkey (fired from pynput's own listener
+    thread) request the overlay window's visibility be flipped, without
+    touching a Qt widget off the GUI thread directly -- Qt widgets may only
+    be shown/hidden from the thread that owns them. toggle_requested is
+    connected to this object's own toggle() method (a real bound method,
+    not a lambda -- see toggle()'s docstring for why that distinction
+    matters), the same cross-thread queued-connection pattern
+    LatestSuggestion above uses.
+    """
+
+    toggle_requested = Signal()
+
+    def __init__(self, overlay_window):
+        """Stores the overlay window this toggle shows/hides, and connects the signal to toggle() below."""
+        super().__init__()
+        self._overlay_window = overlay_window
+        self.toggle_requested.connect(self.toggle)
+
+    def toggle(self):
+        """
+        Shows overlay_window if it's hidden, or hides it if it's shown.
+
+        Connected to toggle_requested as a bound method rather than a
+        lambda specifically so Qt has a real QObject (this one) to read
+        thread affinity from -- a plain lambda has no owning QObject for
+        Qt to key off of, so a cross-thread emit (from pynput's listener
+        thread) would run the lambda directly on that thread instead of
+        marshaling it to the GUI thread that owns overlay_window, which
+        Qt widgets aren't safe against.
+        """
+        self._overlay_window.setVisible(not self._overlay_window.isVisible())
+
+
+def create_overlay_window():
+    """
+    Builds the always-on-top overlay window: frameless, stays above other
+    windows, and shows only the latest suggestion text -- deliberately
+    minimal, per PRD §8 Phase 2 (no transcript, no settings, no session
+    controls here; those all stay on the main window). Starts hidden;
+    create_overlay_toggle() below wires up the hotkey that shows it.
+
+    Returns:
+        tuple[QWidget, QPlainTextEdit]: the overlay window itself, and the
+        read-only pane inside it to keep in sync with the latest
+        suggestion (see connect_incoming_messages_to_ui()).
+    """
+    window = QWidget()
+    window.setWindowTitle("Adarna Overlay")
+    window.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+    window.resize(420, 160)
+
+    layout = QVBoxLayout(window)
+    pane = QPlainTextEdit()
+    pane.setReadOnly(True)
+    layout.addWidget(pane)
+
+    return window, pane
+
+
+def create_overlay_toggle(overlay_window):
+    """
+    Creates the OverlayToggle that the show/hide hotkey uses to flip
+    overlay_window's visibility on the GUI thread.
+
+    Returns:
+        OverlayToggle: emit its toggle_requested signal (safe from any
+        thread) to show the overlay if hidden, or hide it if shown.
+    """
+    return OverlayToggle(overlay_window)
+
+
 def create_suggestions_section(layout):
     """
     Adds a labeled, read-only pane that displays the latest suggestion from
@@ -725,16 +804,20 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
     )
 
 
-def connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion):
+def connect_incoming_messages_to_ui(
+    wsl_connection, transcript_pane, suggestions_pane, latest_suggestion, overlay_pane
+):
     """
     Wires wsl_app's incoming transcript/suggestion messages to the UI: each
     transcript segment is appended to the transcript pane, each suggestion
-    replaces whatever the suggestions pane currently shows, and
-    latest_suggestion is kept in sync so the Copy button always has
-    something current to copy.
+    replaces whatever the suggestions pane and the overlay pane currently
+    show (both render the same incoming suggestion text -- no protocol
+    change needed for the overlay), and latest_suggestion is kept in sync
+    so the Copy button always has something current to copy.
     """
     wsl_connection.transcript_received.connect(transcript_pane.appendPlainText)
     wsl_connection.suggestion_received.connect(suggestions_pane.setPlainText)
+    wsl_connection.suggestion_received.connect(overlay_pane.setPlainText)
     wsl_connection.suggestion_received.connect(latest_suggestion.update)
 
 
@@ -812,21 +895,26 @@ def create_manual_suggestion_trigger(wsl_connection):
     return request_suggestion_now
 
 
-def start_global_hotkey(request_suggestion_now):
+def start_global_hotkeys(hotkey_actions):
     """
-    Registers the global "generate a suggestion now" hotkey (see
-    HOTKEY_COMBINATION), calling `request_suggestion_now` whenever it's
-    pressed. Must work even while windows_app doesn't have focus (the user
-    will be focused on their meeting app), which is why this uses pynput's
-    system-wide hook rather than a plain Qt shortcut (Qt shortcuts only
-    fire while their own window is focused).
+    Registers every global hotkey the app listens for -- currently the
+    "generate a suggestion now" hotkey (HOTKEY_COMBINATION) and the
+    overlay show/hide hotkey (OVERLAY_HOTKEY_COMBINATION) -- from one
+    shared pynput.keyboard.GlobalHotKeys listener. Must work even while
+    windows_app doesn't have focus (the user will be focused on their
+    meeting app), which is why this uses pynput's system-wide hook rather
+    than plain Qt shortcuts (Qt shortcuts only fire while their own window
+    is focused). GlobalHotKeys dispatches each registered combination to
+    its own callback independently, so multiple bindings on one listener
+    don't interfere with each other -- no need for a separate listener per
+    hotkey.
 
     Returns:
         pynput.keyboard.GlobalHotKeys: the running hotkey listener. Must be
         kept referenced by the caller for as long as the app runs, or it
         would be garbage-collected and stop listening.
     """
-    hotkey_listener = keyboard.GlobalHotKeys({HOTKEY_COMBINATION: request_suggestion_now})
+    hotkey_listener = keyboard.GlobalHotKeys(hotkey_actions)
     hotkey_listener.start()
     return hotkey_listener
 
@@ -973,11 +1061,12 @@ def create_session_controls(
 
 def main():
     """
-    Entry point: creates the app and window, starts the background
-    connection to wsl_app, wires up WASAPI loopback audio capture, the
-    settings panel, the auto-suggest toggle and manual trigger button, the
-    session start/stop controls, and the global suggestion hotkey, and runs
-    the event loop until the window is closed.
+    Entry point: creates the app, the main window, and the overlay window,
+    starts the background connection to wsl_app, wires up WASAPI loopback
+    audio capture, the settings panel, the auto-suggest toggle and manual
+    trigger button, the session start/stop controls, and the global
+    suggestion-trigger and overlay show/hide hotkeys, and runs the event
+    loop until the main window is closed.
     """
     app = create_app()
     window = create_window()
@@ -989,6 +1078,7 @@ def main():
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
+    overlay_window, overlay_pane = create_overlay_window()
 
     audio = pyaudio.PyAudio()
     devices = list_loopback_devices(audio)
@@ -996,7 +1086,7 @@ def main():
     populate_device_dropdown(device_dropdown, devices, default_device)
 
     wsl_connection = start_wsl_connection(status_label)
-    connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion)
+    connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion, overlay_pane)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     capture_manager = create_audio_capture_manager(
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
@@ -1012,10 +1102,16 @@ def main():
         layout,
         window,
     )
-    # Kept referenced for the app's lifetime -- see start_global_hotkey()'s docstring.
+    # Kept referenced for the app's lifetime -- see start_global_hotkeys()'s docstring.
     request_suggestion_now = create_manual_suggestion_trigger(wsl_connection)
     generate_suggestion_button.clicked.connect(request_suggestion_now)
-    hotkey_listener = start_global_hotkey(request_suggestion_now)
+    overlay_toggle = create_overlay_toggle(overlay_window)
+    hotkey_listener = start_global_hotkeys(
+        {
+            HOTKEY_COMBINATION: request_suggestion_now,
+            OVERLAY_HOTKEY_COMBINATION: overlay_toggle.toggle_requested.emit,
+        }
+    )
 
     window.show()
     sys.exit(app.exec())
