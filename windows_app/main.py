@@ -12,6 +12,7 @@ from pynput import keyboard
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
@@ -100,7 +101,8 @@ class WslConnection(QObject):
     socket, guarded by a lock so writes never interleave. See wsl_app/main.py
     for the full set of message types this protocol carries: ping/pong,
     audio_chunk, session_started/session_stopped, session_start_failed,
-    hotkey_triggered, settings_changed, transcript, and suggestion.
+    hotkey_triggered, settings_changed, auto_suggest_changed, transcript,
+    and suggestion.
     """
 
     connection_changed = Signal(bool)
@@ -599,17 +601,44 @@ def create_suggestions_section(layout):
     return pane, latest_suggestion
 
 
-def create_settings_panel(layout):
+def create_suggestion_trigger_controls(layout):
     """
-    Adds a labeled settings panel with the mode, Whisper model size, and
-    suggestion pause delay controls used to configure the next session.
-    These values are only read (and sent to wsl_app) when Start Session is
-    pressed — see create_session_controls() — so changing them mid-session
-    has no effect until the next session starts.
+    Adds a row with the "Auto-suggest on pause" checkbox (checked by
+    default, matching today's pre-Phase-1.5 behavior) and a "Generate
+    Suggestion Now" button. Unlike the settings panel above, the checkbox
+    is meant to be flipped live during a running session — see
+    create_session_controls() and wsl_app's SuggestionTrigger — so it lives
+    outside "Session Settings" rather than inside it. The button gives
+    manual triggering an in-window equivalent of the global hotkey, for
+    anyone who'd rather click than reach for a key combination.
 
     Returns:
-        tuple[QComboBox, QComboBox, QComboBox]: the mode, Whisper model
-        size, and suggestion pause dropdowns, in that order.
+        tuple[QCheckBox, QPushButton]: the auto-suggest checkbox and the
+        manual-trigger button.
+    """
+    row = QHBoxLayout()
+    auto_suggest_checkbox = QCheckBox("Auto-suggest on pause")
+    auto_suggest_checkbox.setChecked(True)
+    generate_button = QPushButton("Generate Suggestion Now")
+    row.addWidget(auto_suggest_checkbox)
+    row.addWidget(generate_button)
+    layout.addLayout(row)
+    return auto_suggest_checkbox, generate_button
+
+
+def create_settings_panel(layout):
+    """
+    Adds a labeled settings panel with the mode, Whisper model size,
+    suggestion pause delay, and pre-session context notes controls used to
+    configure the next session. These values are only read (and sent to
+    wsl_app) when Start Session is pressed — see create_session_controls()
+    — so changing them mid-session has no effect until the next session
+    starts.
+
+    Returns:
+        tuple[QComboBox, QComboBox, QComboBox, QPlainTextEdit]: the mode,
+        Whisper model size, and suggestion pause dropdowns, plus the
+        context notes text box, in that order.
     """
     group = QGroupBox("Session Settings")
     form = QFormLayout(group)
@@ -630,11 +659,20 @@ def create_settings_panel(layout):
     pause_dropdown.setCurrentIndex(SUGGESTION_PAUSE_PRESETS_SECONDS.index(DEFAULT_SUGGESTION_PAUSE_SECONDS))
     form.addRow("Suggestion pause:", pause_dropdown)
 
+    context_notes_edit = QPlainTextEdit()
+    context_notes_edit.setPlaceholderText(
+        "Optional: paste anything relevant for this session — a CV/job "
+        "description for an interview, a PRD excerpt or agenda for a "
+        "meeting."
+    )
+    context_notes_edit.setFixedHeight(80)
+    form.addRow("Context notes:", context_notes_edit)
+
     layout.addWidget(group)
-    return mode_dropdown, whisper_model_dropdown, pause_dropdown
+    return mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit
 
 
-def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown):
+def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox):
     """
     Reads the settings panel's current values and packages them into the
     settings_changed message to send wsl_app.
@@ -647,6 +685,8 @@ def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdo
         "mode": MODE_LABELS_TO_VALUES[mode_dropdown.currentText()],
         "whisper_model_size": whisper_model_dropdown.currentText(),
         "suggestion_pause_seconds": pause_dropdown.currentData(),
+        "context_notes": context_notes_edit.toPlainText().strip(),
+        "auto_suggest_enabled": auto_suggest_checkbox.isChecked(),
     }
 
 
@@ -668,6 +708,21 @@ def populate_device_dropdown(dropdown, devices, default_device):
         (i for i, device in enumerate(devices) if device["index"] == default_device["index"]), 0
     )
     dropdown.setCurrentIndex(default_index)
+
+
+def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
+    """
+    Sends wsl_app an auto_suggest_changed message every time the checkbox
+    is flipped, live, so a running session's SuggestionTrigger can turn
+    pause-triggered suggestions on/off immediately — unlike every other
+    settings panel control, this one isn't just read once at Start Session
+    (see current_settings_message(), which also sends its starting value
+    for the next session). wsl_app simply ignores this message if no
+    session is currently active.
+    """
+    auto_suggest_checkbox.toggled.connect(
+        lambda enabled: wsl_connection.send_message({"type": "auto_suggest_changed", "enabled": enabled})
+    )
 
 
 def connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion):
@@ -697,59 +752,79 @@ def start_wsl_connection(status_label):
     return wsl_connection
 
 
-def start_global_hotkey(wsl_connection):
+def create_manual_suggestion_trigger(wsl_connection):
+    """
+    Creates the shared plumbing behind every way of manually asking for a
+    suggestion right now — the global hotkey and the in-window "Generate
+    Suggestion Now" button both end up calling the function this returns.
+    wsl_app decides whether to actually act on it (it's ignored there if no
+    session is running).
+
+    A single persistent worker thread sends every hotkey_triggered message,
+    rather than the caller's own thread sending it directly, and rather
+    than spawning a fresh thread per request. A /code-review catch (Day 7):
+    spawning a fresh thread per request is fine if send_message() returns
+    quickly, but if wsl_app were ever genuinely hung without closing the
+    socket, send_message()'s flush() could block indefinitely -- and a
+    thread per request would then mean an unbounded pile of permanently
+    stuck threads for as long as requests kept coming in during the hang.
+    One dedicated worker bounds that to a single stuck thread at most; the
+    maxsize=1 queue means extra requests while a send is in flight are
+    simply treated as duplicates of the same "generate a suggestion now"
+    request rather than queuing up.
+
+    Returns:
+        Callable[[], None]: call this to request a suggestion right now.
+        Safe to call from any thread, including pynput's listener thread —
+        see the returned function's own docstring for why that matters.
+    """
+    pending_requests = queue.Queue(maxsize=1)
+
+    def send_trigger_messages_to_wsl_app():
+        """Runs for the app's lifetime: sends one hotkey_triggered message to wsl_app each time the returned function records one."""
+        while True:
+            pending_requests.get()
+            wsl_connection.send_message({"type": "hotkey_triggered"})
+
+    threading.Thread(target=send_trigger_messages_to_wsl_app, daemon=True).start()
+
+    def request_suggestion_now():
+        """
+        Records a request for a suggestion, for send_trigger_messages_to_wsl_app()
+        to actually send. Never sends directly from here: this can be
+        called from pynput's own listener thread, which also pumps the
+        low-level keyboard hook Windows delivers every key event through,
+        so anything that blocks here would delay it from noticing the next
+        key press for as long as the block lasts -- and send_message() can
+        itself block briefly on the network socket if wsl_app falls behind
+        reading it (see project_notes.md, Day 11). Routing the in-window
+        button's click through the same queue keeps it just as safe, and
+        means a click and a hotkey press pressed at nearly the same moment
+        collapse into one request instead of two.
+        """
+        try:
+            pending_requests.put_nowait(None)
+        except queue.Full:
+            pass  # a send is already pending; this request is a duplicate of that one
+
+    return request_suggestion_now
+
+
+def start_global_hotkey(request_suggestion_now):
     """
     Registers the global "generate a suggestion now" hotkey (see
-    HOTKEY_COMBINATION) and sends wsl_app a hotkey_triggered message
-    whenever it's pressed. wsl_app decides whether to actually act on it
-    (it's ignored there if no session is running).
+    HOTKEY_COMBINATION), calling `request_suggestion_now` whenever it's
+    pressed. Must work even while windows_app doesn't have focus (the user
+    will be focused on their meeting app), which is why this uses pynput's
+    system-wide hook rather than a plain Qt shortcut (Qt shortcuts only
+    fire while their own window is focused).
 
     Returns:
         pynput.keyboard.GlobalHotKeys: the running hotkey listener. Must be
         kept referenced by the caller for as long as the app runs, or it
         would be garbage-collected and stop listening.
     """
-
-    # A single persistent worker sends every hotkey_triggered message, rather
-    # than pynput's listener thread sending it directly (see
-    # notify_wsl_app_hotkey_was_pressed() below for why) and rather than
-    # spawning a fresh thread per press. A /code-review catch: spawning a
-    # fresh thread per press is fine if send_message() returns quickly, but
-    # if wsl_app were ever genuinely hung without closing the socket,
-    # send_message()'s flush() could block indefinitely -- and a thread per
-    # press would then mean an unbounded pile of permanently stuck threads
-    # for as long as the user kept pressing the hotkey during the hang. One
-    # dedicated worker bounds that to a single stuck thread at most; the
-    # maxsize=1 queue means extra presses while a send is in flight are
-    # simply treated as duplicates of the same "generate a suggestion now"
-    # request rather than queuing up.
-    pending_hotkey_presses = queue.Queue(maxsize=1)
-
-    def send_hotkey_messages_to_wsl_app():
-        """Runs for the app's lifetime: sends one hotkey_triggered message to wsl_app each time notify_wsl_app_hotkey_was_pressed() records one."""
-        while True:
-            pending_hotkey_presses.get()
-            wsl_connection.send_message({"type": "hotkey_triggered"})
-
-    threading.Thread(target=send_hotkey_messages_to_wsl_app, daemon=True).start()
-
-    def notify_wsl_app_hotkey_was_pressed():
-        """
-        Records that the hotkey was pressed, for send_hotkey_messages_to_wsl_app()
-        to actually send. Never sends directly from here: this runs on
-        pynput's own listener thread, which also pumps the low-level
-        keyboard hook Windows delivers every key event through, so anything
-        that blocks here would delay it from noticing the next key press for
-        as long as the block lasts -- and send_message() can itself block
-        briefly on the network socket if wsl_app falls behind reading it
-        (see project_notes.md, Day 11).
-        """
-        try:
-            pending_hotkey_presses.put_nowait(None)
-        except queue.Full:
-            pass  # a send is already pending; this press is a duplicate of that one
-
-    hotkey_listener = keyboard.GlobalHotKeys({HOTKEY_COMBINATION: notify_wsl_app_hotkey_was_pressed})
+    hotkey_listener = keyboard.GlobalHotKeys({HOTKEY_COMBINATION: request_suggestion_now})
     hotkey_listener.start()
     return hotkey_listener
 
@@ -775,15 +850,24 @@ def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default
 
 
 def create_session_controls(
-    wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout, window
+    wsl_connection,
+    capture_manager,
+    mode_dropdown,
+    whisper_model_dropdown,
+    pause_dropdown,
+    context_notes_edit,
+    auto_suggest_checkbox,
+    layout,
+    window,
 ):
     """
     Adds the Start Session / Stop Session buttons and wires them up:
-    starting sends the settings panel's current values as settings_changed,
-    then session_started (tagged with a fresh attempt_id — see
-    handle_session_start_failed), and starts audio capture; stopping sends
-    session_stopped and stops it. Button enabled-state tracks which action
-    is currently valid.
+    starting sends the settings panel's current values (including the
+    context notes and the auto-suggest checkbox's starting state) as
+    settings_changed, then session_started (tagged with a fresh
+    attempt_id — see handle_session_start_failed), and starts audio
+    capture; stopping sends session_stopped and stops it. Button
+    enabled-state tracks which action is currently valid.
 
     Also handles three ways a session can end itself, all reverting to the
     same clean pre-session UI state stop_session() reaches (see
@@ -824,7 +908,9 @@ def create_session_controls(
         nonlocal current_attempt_id
         current_attempt_id += 1
         wsl_connection.send_message(
-            current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown)
+            current_settings_message(
+                mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox
+            )
         )
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
         capture_manager.start_capture()
@@ -887,8 +973,9 @@ def main():
     """
     Entry point: creates the app and window, starts the background
     connection to wsl_app, wires up WASAPI loopback audio capture, the
-    settings panel, the session start/stop controls, and the global
-    suggestion hotkey, and runs the event loop until the window is closed.
+    settings panel, the auto-suggest toggle and manual trigger button, the
+    session start/stop controls, and the global suggestion hotkey, and runs
+    the event loop until the window is closed.
     """
     app = create_app()
     window = create_window()
@@ -896,7 +983,8 @@ def main():
     status_label = create_connection_status_label(layout)
     device_dropdown = create_device_dropdown(layout)
     capture_status_label = create_capture_status_label(layout)
-    mode_dropdown, whisper_model_dropdown, pause_dropdown = create_settings_panel(layout)
+    mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
+    auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
 
@@ -907,14 +995,25 @@ def main():
 
     wsl_connection = start_wsl_connection(status_label)
     connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion)
+    connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     capture_manager = create_audio_capture_manager(
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
     )
     create_session_controls(
-        wsl_connection, capture_manager, mode_dropdown, whisper_model_dropdown, pause_dropdown, layout, window
+        wsl_connection,
+        capture_manager,
+        mode_dropdown,
+        whisper_model_dropdown,
+        pause_dropdown,
+        context_notes_edit,
+        auto_suggest_checkbox,
+        layout,
+        window,
     )
     # Kept referenced for the app's lifetime -- see start_global_hotkey()'s docstring.
-    hotkey_listener = start_global_hotkey(wsl_connection)
+    request_suggestion_now = create_manual_suggestion_trigger(wsl_connection)
+    generate_suggestion_button.clicked.connect(request_suggestion_now)
+    hotkey_listener = start_global_hotkey(request_suggestion_now)
 
     window.show()
     sys.exit(app.exec())

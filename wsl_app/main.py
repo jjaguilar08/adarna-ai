@@ -20,6 +20,15 @@ from faster_whisper import WhisperModel
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 STATS_WINDOW_SECONDS = 1.0
 
+# asyncio's StreamReader defaults to a 64KiB limit on how long one
+# newline-delimited message line can be before readline() gives up and
+# raises -- fine for the small control messages this protocol used to
+# carry, but the Phase 1.5 context_notes field explicitly invites pasting
+# a whole CV/JD or PRD excerpt into one settings_changed line, which can
+# realistically exceed that. Raised generously (well above any single
+# audio_chunk message too) so a large paste doesn't crash the connection.
+MAX_MESSAGE_LINE_BYTES = 10 * 1024 * 1024
+
 # Speech detection and transcription both want 16kHz mono audio.
 TARGET_SAMPLE_RATE = 16000
 
@@ -81,10 +90,10 @@ def load_port():
 
 
 # Every message is one JSON object with a "type" field, newline-delimited.
-# session_started/session_stopped, audio_chunk, hotkey_triggered, and
-# settings_changed are all one-way messages handled directly in
-# handle_client() below since they don't need a reply. This function only
-# covers the ones that do (currently just ping/pong).
+# session_started/session_stopped, audio_chunk, hotkey_triggered,
+# settings_changed, and auto_suggest_changed are all one-way messages
+# handled directly in handle_client() below since they don't need a reply.
+# This function only covers the ones that do (currently just ping/pong).
 async def build_reply(message):
     """
     Decides how to respond to one incoming message, based on its "type".
@@ -479,6 +488,8 @@ def default_settings():
         "mode": DEFAULT_MODE,
         "whisper_model_size": DEFAULT_WHISPER_MODEL_SIZE,
         "suggestion_pause_seconds": PAUSE_SECONDS_BEFORE_SUGGESTION,
+        "context_notes": "",
+        "auto_suggest_enabled": True,
     }
 
 
@@ -509,14 +520,18 @@ async def handle_client(model_manager, reader, writer):
     segmentation/transcription.
 
     A "session" is bounded by explicit session_started/session_stopped
-    messages from windows_app. audio_chunk and hotkey_triggered messages
-    are only processed while a session is active — either arriving outside
-    a session is ignored (defensive: windows_app should only be sending
-    them during a session anyway). settings_changed just remembers the
-    values it carries (pending_settings) for whichever session starts
-    next — windows_app sends it once, right before session_started, every
-    time Start Session is pressed, so it's never applied to an
-    already-running session. Starting a session creates a fresh
+    messages from windows_app. audio_chunk, hotkey_triggered, and
+    auto_suggest_changed messages are only processed while a session is
+    active — either arriving outside a session is ignored (defensive:
+    windows_app should only be sending them during a session anyway).
+    settings_changed just remembers the values it carries (pending_settings)
+    for whichever session starts next — windows_app sends it once, right
+    before session_started, every time Start Session is pressed, so it's
+    never applied to an already-running session; auto_suggest_changed is
+    the one setting that's different, since it's meant to be flipped live
+    mid-session (see SuggestionTrigger.set_auto_suggest_enabled) rather
+    than only taking effect on the next session. Starting a session creates
+    a fresh
     MeetingSession (fresh speech segmenter, fresh claude CLI process, empty
     transcript context) using those settings, so no state bleeds across
     sessions; stopping one force-closes whatever segment is still open so a
@@ -551,7 +566,12 @@ async def handle_client(model_manager, reader, writer):
                 try:
                     await model_manager.ensure_model_size(settings["whisper_model_size"])
                     new_session = MeetingSession(
-                        writer, model_manager.model, settings["mode"], settings["suggestion_pause_seconds"]
+                        writer,
+                        model_manager.model,
+                        settings["mode"],
+                        settings["suggestion_pause_seconds"],
+                        settings["context_notes"],
+                        settings["auto_suggest_enabled"],
                     )
                 except Exception as error:
                     print(f"Failed to start session: {error}")
@@ -584,6 +604,9 @@ async def handle_client(model_manager, reader, writer):
                     session.trigger.notify_hotkey_pressed()
             elif message_type == "settings_changed":
                 pending_settings = settings_from_message(message)
+            elif message_type == "auto_suggest_changed":
+                if session is not None:
+                    session.set_auto_suggest_enabled(bool(message.get("enabled", True)))
             else:
                 reply = await build_reply(message)
                 if reply is not None:
@@ -606,7 +629,9 @@ async def run_server(model_manager):
         """Adapts handle_client to asyncio.start_server's (reader, writer) callback shape."""
         await handle_client(model_manager, reader, writer)
 
-    server = await asyncio.start_server(handle_client_connection, "127.0.0.1", port)
+    server = await asyncio.start_server(
+        handle_client_connection, "127.0.0.1", port, limit=MAX_MESSAGE_LINE_BYTES
+    )
     print(f"wsl_app listening on 127.0.0.1:{port}")
     async with server:
         await server.serve_forever()
@@ -614,32 +639,64 @@ async def run_server(model_manager):
 
 # The framing given to every prompt sent through a session's ClaudeCli,
 # chosen per session by mode (see MeetingSession). Both end with the same
-# instruction, added after Day 6 testing showed the model answering with
+# instruction. Originally (Day 6) this asked for a single ready-to-read
+# spoken line, after testing showed the model otherwise answering with
 # multiple options and meta-commentary ("Here's a natural way to continue:
-# ... Or shorter/more neutral: ...") instead of one line someone could
-# actually say out loud.
-RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION = (
-    "Respond with only the single line you'd say out loud — no options, no "
-    "meta-commentary, no explanation."
+# ... Or shorter/more neutral: ..."). Changed (Phase 1.5, Day 12) after real
+# usage showed a full scripted line wasn't what was actually wanted live —
+# the user wants terms/concepts/key points to build their own answer from,
+# not a script to read verbatim.
+RESPOND_WITH_TERMS_INSTRUCTION = (
+    "Respond with only a short, comma-separated list of the key terms, "
+    "concepts, or points the user could build their own answer from — not "
+    "a full sentence or a script to read out loud, and not a structured "
+    "breakdown or bulleted essay either. Something glanceable in a couple "
+    "seconds during a live conversation, e.g. \"Encapsulation, Inheritance, "
+    "Polymorphism, Abstraction\" rather than a paragraph. At most 5-8 terms. "
+    "Add a clause of context after a term only if it's genuinely necessary "
+    "to disambiguate — a few words, not a sentence. No options, no "
+    "meta-commentary, no explanation, no markdown formatting."
 )
 
 MEETING_SYSTEM_PROMPT = (
     "You are assisting the user live during a work meeting. Given a snippet "
-    "of recent conversation, suggest a brief, natural response they could "
-    "say next. " + RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION
+    "of recent conversation, suggest the key terms, concepts, or points "
+    "relevant to what's being discussed. " + RESPOND_WITH_TERMS_INSTRUCTION
 )
 
 INTERVIEW_SYSTEM_PROMPT = (
     "You are assisting the user live during a job interview, in which the "
     "user is the candidate being interviewed. Given a snippet of the "
-    "interviewer's most recent question or remark, suggest a brief, "
-    "confident answer the user could give next. " + RESPOND_WITH_ONLY_THE_LINE_INSTRUCTION
+    "interviewer's most recent question or remark, suggest the key terms, "
+    "concepts, or points the user could use to build their own answer. "
+    + RESPOND_WITH_TERMS_INSTRUCTION
 )
 
 SYSTEM_PROMPT_BY_MODE = {
     "meeting": MEETING_SYSTEM_PROMPT,
     "interview": INTERVIEW_SYSTEM_PROMPT,
 }
+
+
+def build_system_prompt(mode, context_notes):
+    """
+    Builds the full system prompt for a session: the mode's base framing,
+    plus the user's pre-session context notes (a CV/job description, a
+    PRD/agenda excerpt) appended if they provided any. Left off entirely
+    when context_notes is empty, so a session with nothing pasted in
+    behaves exactly as before this was added.
+
+    Returns:
+        str: the system prompt to start this session's ClaudeCli with.
+    """
+    prompt = SYSTEM_PROMPT_BY_MODE.get(mode, MEETING_SYSTEM_PROMPT)
+    if context_notes:
+        prompt += (
+            "\n\nThe user has also provided the following context notes for "
+            "this session — use them to inform your suggestions where "
+            "relevant:\n" + context_notes
+        )
+    return prompt
 
 
 class ClaudeCli:
@@ -767,9 +824,18 @@ class SuggestionTrigger:
     spawn a fresh claude CLI process to do it) for a session that no longer
     has anywhere to send it — an orphaned process with nothing left to stop
     it.
+
+    Auto-suggest (see set_auto_suggest_enabled) is a separate, live-
+    toggleable on/off switch for step 2 only: while disabled, a new segment
+    is still noted (so a suggestion can still reflect it once re-enabled or
+    once the hotkey is pressed), but no pause timer is ever scheduled for
+    it, so a pause during a real, ongoing meeting genuinely produces no
+    suggestion rather than one that's merely discarded when the timer
+    fires. Step 3 (the hotkey) is never affected by this switch — the
+    hotkey/button path always works, on or off.
     """
 
-    def __init__(self, generate_suggestion, pause_seconds):
+    def __init__(self, generate_suggestion, pause_seconds, auto_suggest_enabled=True):
         """
         Stores the async function to call when the trigger fires, and how
         long the pause timer (step 2 above) should wait. Starts idle: no
@@ -777,17 +843,36 @@ class SuggestionTrigger:
         """
         self._generate_suggestion = generate_suggestion
         self._pause_seconds = pause_seconds
+        self._auto_suggest_enabled = auto_suggest_enabled
         self._new_segment_since_last_suggestion = False
         self._pause_timer_task = None
         self._stopped = False
 
     def notify_new_segment(self):
-        """Call once for every newly-transcribed segment. See class docstring, step 1. A no-op once stopped."""
+        """
+        Call once for every newly-transcribed segment. See class docstring,
+        step 1. A no-op once stopped. Only schedules the pause timer while
+        auto-suggest is enabled (see set_auto_suggest_enabled) — otherwise
+        the segment is remembered, but nothing is scheduled to fire from it.
+        """
         if self._stopped:
             return
         self._new_segment_since_last_suggestion = True
         self._cancel_pause_timer()
-        self._pause_timer_task = asyncio.create_task(self._wait_then_fire())
+        if self._auto_suggest_enabled:
+            self._pause_timer_task = asyncio.create_task(self._wait_then_fire())
+
+    def set_auto_suggest_enabled(self, enabled):
+        """
+        Turns pause-triggered suggestions on or off, live, without touching
+        the hotkey/button path (see class docstring). Turning it off cancels
+        whatever pause timer is currently running, if any, so a pause
+        already in progress at the moment it's switched off doesn't still
+        fire.
+        """
+        self._auto_suggest_enabled = enabled
+        if not enabled:
+            self._cancel_pause_timer()
 
     def notify_hotkey_pressed(self):
         """Call when windows_app reports the hotkey was pressed. See class docstring, step 3. A no-op once stopped."""
@@ -835,19 +920,21 @@ class MeetingSession:
     doesn't lose the transcript context built up so far.
     """
 
-    def __init__(self, writer, model, mode, pause_seconds):
+    def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=True):
         """
         Starts a fresh session using the settings captured for it at
         session_started (see handle_client): new segmenter, `model` as the
         Whisper model this session transcribes with for its entire
-        lifetime, a new claude CLI process framed for `mode`, empty
-        transcript history, and a suggestion trigger using `pause_seconds`.
+        lifetime, a new claude CLI process framed for `mode` and
+        `context_notes`, empty transcript history, and a suggestion trigger
+        using `pause_seconds` and starting with auto-suggest set to
+        `auto_suggest_enabled`.
         """
         self.writer = writer
         self.model = model
         self.segmenter = VoiceSegmenter()
         self.recent_transcript_segments = []
-        self._system_prompt = SYSTEM_PROMPT_BY_MODE.get(mode, MEETING_SYSTEM_PROMPT)
+        self._system_prompt = build_system_prompt(mode, context_notes)
         print(f"Starting claude CLI process for this session (mode: {mode})...")
         self._claude_cli = ClaudeCli(self._system_prompt)
         self._ask_call_count = 0
@@ -857,7 +944,11 @@ class MeetingSession:
         # and close() must never stop the process while an ask() started by
         # the pause timer or the hotkey is still using it.
         self._claude_cli_lock = asyncio.Lock()
-        self.trigger = SuggestionTrigger(self._generate_and_send_suggestion, pause_seconds)
+        self.trigger = SuggestionTrigger(self._generate_and_send_suggestion, pause_seconds, auto_suggest_enabled)
+
+    def set_auto_suggest_enabled(self, enabled):
+        """Turns this session's pause-triggered suggestions on or off, live. See SuggestionTrigger.set_auto_suggest_enabled."""
+        self.trigger.set_auto_suggest_enabled(enabled)
 
     def add_transcript_segment(self, text):
         """
