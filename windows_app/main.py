@@ -538,6 +538,21 @@ def create_session_buttons(layout):
     return start_button, stop_button
 
 
+def create_readonly_text_pane(layout):
+    """
+    Adds a scrolling, read-only text pane to layout -- the shared shape
+    behind the transcript pane, the suggestions pane, and the overlay's
+    pane, so the three don't each hand-roll the same three lines.
+
+    Returns:
+        QPlainTextEdit: the pane, already added to layout.
+    """
+    pane = QPlainTextEdit()
+    pane.setReadOnly(True)
+    layout.addWidget(pane)
+    return pane
+
+
 def create_transcript_pane(layout):
     """
     Adds a labeled, scrolling, read-only pane that displays each transcript
@@ -547,10 +562,7 @@ def create_transcript_pane(layout):
         QPlainTextEdit: the pane to append new transcript text to.
     """
     layout.addWidget(QLabel("Transcript"))
-    pane = QPlainTextEdit()
-    pane.setReadOnly(True)
-    layout.addWidget(pane)
-    return pane
+    return create_readonly_text_pane(layout)
 
 
 class LatestSuggestion(QObject):
@@ -580,11 +592,10 @@ class OverlayToggle(QObject):
     Lets the global show/hide hotkey (fired from pynput's own listener
     thread) request the overlay window's visibility be flipped, without
     touching a Qt widget off the GUI thread directly -- Qt widgets may only
-    be shown/hidden from the thread that owns them. toggle_requested is
-    connected to this object's own toggle() method (a real bound method,
-    not a lambda -- see toggle()'s docstring for why that distinction
-    matters), the same cross-thread queued-connection pattern
-    LatestSuggestion above uses.
+    be shown/hidden from the thread that owns them. A QObject for the same
+    reason LatestSuggestion above is one (see that class's docstring); see
+    toggle()'s own docstring for the separate reason it's connected to a
+    real bound method rather than a lambda.
     """
 
     toggle_requested = Signal()
@@ -618,6 +629,12 @@ def create_overlay_window():
     controls here; those all stay on the main window). Starts hidden;
     create_overlay_toggle() below wires up the hotkey that shows it.
 
+    WA_QuitOnClose is turned off for this window specifically so it
+    doesn't count toward Qt's "quit once every counted window is closed"
+    check -- without this, closing the main window while the overlay
+    happens to still be visible would leave the app running invisibly,
+    since the overlay would still be an open, counted window.
+
     Returns:
         tuple[QWidget, QPlainTextEdit]: the overlay window itself, and the
         read-only pane inside it to keep in sync with the latest
@@ -627,11 +644,10 @@ def create_overlay_window():
     window.setWindowTitle("Adarna Overlay")
     window.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
     window.resize(420, 160)
+    window.setAttribute(Qt.WA_QuitOnClose, False)
 
     layout = QVBoxLayout(window)
-    pane = QPlainTextEdit()
-    pane.setReadOnly(True)
-    layout.addWidget(pane)
+    pane = create_readonly_text_pane(layout)
 
     return window, pane
 
@@ -662,9 +678,7 @@ def create_suggestions_section(layout):
         suggestion text (see main()).
     """
     layout.addWidget(QLabel("Suggestions"))
-    pane = QPlainTextEdit()
-    pane.setReadOnly(True)
-    layout.addWidget(pane)
+    pane = create_readonly_text_pane(layout)
 
     latest_suggestion = LatestSuggestion()
 

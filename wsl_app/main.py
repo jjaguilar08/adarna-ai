@@ -644,29 +644,43 @@ async def run_server(model_manager):
 # multiple options and meta-commentary ("Here's a natural way to continue:
 # ... Or shorter/more neutral: ..."). Changed (Phase 1.5, Day 12) to ask for
 # terms/concepts instead of a script, but that didn't hold up in real use —
-# reverted (Phase 1.5b, Day 13) back to a script, this time explicitly
-# longer than Day 6's original bare line so it actually carries substance.
-RESPOND_WITH_SCRIPT_INSTRUCTION = (
-    "Respond with a real, ready-to-say response of 2-4 sentences — enough "
-    "to carry actual substance and reasoning behind it, not just a single "
-    "terse line. Write it the way the user would actually say it out loud "
-    "in the moment: plain spoken language, no meta-commentary, no multiple "
-    "options, no markdown formatting, no bullet points or lists. Still "
-    "short enough to skim and say out loud in a few seconds — a real "
-    "answer, not an essay."
+# reverted (Phase 1.5b, Day 13) back to a script. Changed again (Phase 2.5,
+# Day 15) to a short lead plus bullets — a fixed script read back verbatim
+# didn't match how the user actually used it in real sessions; a lead the
+# user skims plus bullets they pick from fits real use better, closer to
+# how the real ParakeetAI presents suggestions (PRD §8, Phase 2.5). The
+# literal "- " bullet markers and one-point-per-line instruction are
+# deliberate, not decorative — windows_app's suggestion panes render
+# whatever text comes back as-is (see create_suggestions_section() and
+# create_overlay_window()), so the CLI's raw output has to already be in a
+# genuinely renderable bullet shape, not prose that merely mentions bullets.
+RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION = (
+    "Respond in plain text only — no markdown headers, bold, or numbered "
+    "lists — in exactly this shape:\n\n"
+    "First, a lead of 1-2 sentences: the general framing of how the user "
+    "could respond, written in plain spoken language.\n"
+    "Then, a blank line, followed by 3-5 bullet points, each on its own "
+    "line starting with \"- \" — specific details, angles, reasons, or "
+    "examples the user could pull from to build their actual answer. One "
+    "point per line, no sub-bullets, no further punctuation before the "
+    "dash.\n\n"
+    "The user will skim the lead, then pick whichever bullets actually fit "
+    "what they want to say — this is not a fixed script to read back "
+    "verbatim. Keep the lead and each bullet short enough to skim in a few "
+    "seconds; no meta-commentary, no multiple alternative versions."
 )
 
 MEETING_SYSTEM_PROMPT = (
     "You are assisting the user live during a work meeting. Given a snippet "
     "of recent conversation, suggest how the user could respond to what's "
-    "being discussed. " + RESPOND_WITH_SCRIPT_INSTRUCTION
+    "being discussed. " + RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION
 )
 
 INTERVIEW_SYSTEM_PROMPT = (
     "You are assisting the user live during a job interview, in which the "
     "user is the candidate being interviewed. Given a snippet of the "
     "interviewer's most recent question or remark, suggest how the user "
-    "could answer it. " + RESPOND_WITH_SCRIPT_INSTRUCTION
+    "could answer it. " + RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION
 )
 
 SYSTEM_PROMPT_BY_MODE = {
