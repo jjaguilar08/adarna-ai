@@ -14,8 +14,13 @@ import traceback
 from pathlib import Path
 
 import numpy
-import webrtcvad
 from faster_whisper import WhisperModel
+
+from streaming_transcriber import (
+    PARTIAL_UPDATE_INTERVAL_SECONDS,
+    StreamingTranscriber,
+    TARGET_SAMPLE_RATE,
+)
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 STATS_WINDOW_SECONDS = 1.0
@@ -29,38 +34,11 @@ STATS_WINDOW_SECONDS = 1.0
 # audio_chunk message too) so a large paste doesn't crash the connection.
 MAX_MESSAGE_LINE_BYTES = 10 * 1024 * 1024
 
-# Speech detection and transcription both want 16kHz mono audio.
-TARGET_SAMPLE_RATE = 16000
-
-# The speech detector (webrtcvad) can only judge audio in fixed-size
-# slices, one at a time — never a variable amount. 30 milliseconds is a
-# size it supports; everything below is derived from that.
-FRAME_DURATION_MS = 30
-FRAME_DURATION_SECONDS = FRAME_DURATION_MS / 1000
-BYTES_PER_FRAME = int(TARGET_SAMPLE_RATE * FRAME_DURATION_SECONDS) * 2  # 16-bit samples
-
-# webrtcvad's own "how strict should speech-detection be" setting, on its
-# own 0-3 scale: 0 accepts more borderline sound as speech, 3 rejects more
-# of it. 2 is a reasonable middle ground to start from.
-SPEECH_DETECTION_STRICTNESS = 2
-
-# How long a pause has to last before we consider a sentence "done" and
-# close the segment.
-SILENCE_SECONDS_TO_CLOSE_SEGMENT = 0.4
-
-# Safety net: force-close a segment after this long even without a pause,
-# so one uninterrupted run-on sentence can't grow the buffer forever.
-MAX_SEGMENT_SECONDS = 20.0
-
-# Segments shorter than this are almost always a false positive from the
-# speech detector (a brief noise blip, not real speech), so skip the
-# (expensive) transcription call for them entirely rather than spending a
-# full model call for nothing.
-MIN_SEGMENT_SECONDS_TO_TRANSCRIBE = 0.3
-
-# Whisper model size and assistant mode to use for a session that starts
-# before windows_app has ever sent a settings_changed message.
-DEFAULT_WHISPER_MODEL_SIZE = "small.en"
+# The Whisper model size and assistant mode to use for a session that
+# starts before windows_app has ever sent a settings_changed message.
+# base.en is the only model size the live streaming path supports (Day 17
+# -- see WhisperModelManager below) -- it's no longer a session setting.
+DEFAULT_WHISPER_MODEL_SIZE = "base.en"
 DEFAULT_MODE = "meeting"
 
 # How long a pause has to last, with no further new transcript segment
@@ -155,128 +133,6 @@ def convert_audio_to_common_format(samples, sample_rate, channels):
     return audio_bytes
 
 
-class VoiceSegmenter:
-    """
-    Watches a steady stream of incoming audio and figures out where each
-    spoken sentence starts and ends, so each one can be sent to Whisper on
-    its own instead of transcribing everything as one giant blob.
-
-    How a segment opens and closes:
-      1. While nothing is being said, incoming audio is thrown away.
-      2. The moment speech is heard, a new segment starts recording.
-      3. The segment keeps recording through speech AND short pauses.
-      4. Once a pause has lasted SILENCE_SECONDS_TO_CLOSE_SEGMENT, the
-         segment is considered finished ("that was one sentence") and is
-         handed back to the caller.
-      5. If speech runs on for MAX_SEGMENT_SECONDS without ever pausing
-         that long, the segment is force-closed anyway, so one very long
-         run-on sentence can't grow the recording forever.
-    """
-
-    def __init__(self):
-        """Starts with nothing recorded yet and no segment in progress."""
-        self._speech_detector = webrtcvad.Vad(SPEECH_DETECTION_STRICTNESS)
-        # Audio that has arrived but hasn't been sliced into a full frame yet.
-        self._unsliced_audio = bytearray()
-        # Audio recorded for the segment currently in progress, if any.
-        self._current_segment_audio = bytearray()
-        self._segment_is_open = False
-        self._seconds_of_silence_in_a_row = 0.0
-        self._seconds_recorded_in_current_segment = 0.0
-
-    def add_audio(self, audio_bytes):
-        """
-        Feeds newly-arrived 16kHz mono audio into the segmenter.
-
-        The speech detector can only judge one fixed-size 30ms slice of
-        audio at a time, but audio arrives in whatever size chunks the
-        network happens to deliver. So this keeps a small leftover buffer,
-        cuts off exactly one 30ms slice at a time as enough audio piles
-        up, and checks each slice in turn.
-
-        Returns:
-            list[bytes]: zero or more segments that finished (closed)
-            while processing this batch of audio, each ready to hand to
-            Whisper. Usually empty — most calls just add to an
-            open segment without finishing it.
-        """
-        self._unsliced_audio.extend(audio_bytes)
-
-        finished_segments = []
-        while len(self._unsliced_audio) >= BYTES_PER_FRAME:
-            one_frame = bytes(self._unsliced_audio[:BYTES_PER_FRAME])
-            del self._unsliced_audio[:BYTES_PER_FRAME]
-            finished_segment = self._add_frame_to_current_segment(one_frame)
-            if finished_segment is not None:
-                finished_segments.append(finished_segment)
-
-        return finished_segments
-
-    def _add_frame_to_current_segment(self, frame):
-        """
-        Asks the speech detector whether this one 30ms slice contains
-        speech, then updates the segment currently being recorded (if
-        any). Called once per slice, in order, by add_audio().
-
-        Returns:
-            bytes | None: the finished segment, if this slice was the one
-            that closed it. None if the segment is still open, or if
-            there's no segment in progress and this slice was silence.
-        """
-        this_frame_is_speech = self._speech_detector.is_speech(frame, TARGET_SAMPLE_RATE)
-
-        if not this_frame_is_speech and not self._segment_is_open:
-            # Plain silence and nothing recording yet — nothing to do.
-            return None
-
-        self._current_segment_audio.extend(frame)
-        self._seconds_recorded_in_current_segment += FRAME_DURATION_SECONDS
-
-        if this_frame_is_speech:
-            self._segment_is_open = True
-            self._seconds_of_silence_in_a_row = 0.0
-        else:
-            self._seconds_of_silence_in_a_row += FRAME_DURATION_SECONDS
-            if self._seconds_of_silence_in_a_row >= SILENCE_SECONDS_TO_CLOSE_SEGMENT:
-                return self._close_current_segment()
-
-        if self._seconds_recorded_in_current_segment >= MAX_SEGMENT_SECONDS:
-            return self._close_current_segment()
-
-        return None
-
-    def _close_current_segment(self):
-        """
-        Packages up everything recorded for the current segment so it can
-        be handed off for transcription, then resets so the next speech
-        heard starts a brand new segment.
-
-        Returns:
-            bytes: the finished segment's audio.
-        """
-        finished_segment_audio = bytes(self._current_segment_audio)
-        self._current_segment_audio = bytearray()
-        self._segment_is_open = False
-        self._seconds_of_silence_in_a_row = 0.0
-        self._seconds_recorded_in_current_segment = 0.0
-        return finished_segment_audio
-
-    def close_open_segment(self):
-        """
-        Force-closes whatever segment is currently in progress, if any.
-        Used when a session stops, so audio that hasn't hit a silence gap
-        yet (someone stops the session right after finishing a sentence)
-        isn't silently dropped.
-
-        Returns:
-            bytes | None: the finished segment's audio, or None if nothing
-            was open.
-        """
-        if not self._segment_is_open:
-            return None
-        return self._close_current_segment()
-
-
 def load_whisper_model(model_size):
     """
     Loads a faster-whisper model of the given size. Loading takes a few
@@ -295,65 +151,20 @@ def load_whisper_model(model_size):
 
 class WhisperModelManager:
     """
-    Owns the one Whisper model currently loaded and shared by whichever
-    session is active. A session's chosen model size only takes effect at
-    session_started (see handle_client) — ensure_model_size() reloads the
-    model then, but only if the requested size actually differs from what's
-    already loaded, so starting several sessions in a row with the same
-    setting doesn't pay the multi-second reload cost each time.
+    Owns the one Whisper model shared by whichever session is active.
+    Always base.en (Day 17) -- the live streaming transcript path is
+    structurally tied to it (see wsl_app/research/day16/README.md,
+    Finding 1): base.en is the only model on this hardware whose per-call
+    decode floor (~0.5-0.8s) sustains the ~1.5-2s partial-update cadence
+    StreamingTranscriber targets -- small.en (the old default) floors at
+    ~1.7-2.3s per call, already slower than the cadence itself. No longer
+    session-configurable -- windows_app's Settings panel dropped its
+    Whisper model dropdown for the same reason.
     """
 
     def __init__(self):
-        """Loads the default-size model right away, so it's ready before the first session."""
-        self.model_size = DEFAULT_WHISPER_MODEL_SIZE
-        self.model = load_whisper_model(self.model_size)
-
-    async def ensure_model_size(self, requested_model_size):
-        """
-        Reloads the model if `requested_model_size` differs from what's
-        currently loaded. Runs the (blocking) load in a background thread
-        so it doesn't stall the server while it happens.
-        """
-        if requested_model_size == self.model_size:
-            return
-        print(f"Reloading Whisper model: {self.model_size} -> {requested_model_size}")
-        self.model = await asyncio.to_thread(load_whisper_model, requested_model_size)
-        self.model_size = requested_model_size
-
-
-def prepare_audio_for_whisper(audio_bytes):
-    """
-    Converts audio bytes into the number format faster-whisper expects to
-    read them in directly.
-
-    Returns:
-        numpy.ndarray: mono samples in the range [-1.0, 1.0].
-    """
-    int16_samples = numpy.frombuffer(audio_bytes, dtype=numpy.int16)
-    return int16_samples.astype(numpy.float32) / 32768.0
-
-
-def transcribe_audio(model, audio_bytes):
-    """
-    Runs Whisper on one closed speech segment. This is blocking, CPU-bound
-    work — always call it through asyncio.to_thread(), never directly on
-    the event loop.
-
-    Returns:
-        str: the transcribed text, stripped of leading/trailing whitespace.
-    """
-    audio = prepare_audio_for_whisper(audio_bytes)
-    segments, _ = model.transcribe(audio, language="en")
-    return " ".join(segment.text.strip() for segment in segments).strip()
-
-
-def segment_duration_seconds(audio_bytes):
-    """
-    Returns:
-        float: how many seconds of audio `audio_bytes` (16-bit mono PCM at
-        TARGET_SAMPLE_RATE) represents.
-    """
-    return len(audio_bytes) / 2 / TARGET_SAMPLE_RATE
+        """Loads base.en right away, so it's ready before the first session."""
+        self.model = load_whisper_model(DEFAULT_WHISPER_MODEL_SIZE)
 
 
 async def send_message(writer, message):
@@ -374,53 +185,6 @@ async def send_message(writer, message):
         # Covers ConnectionResetError/BrokenPipeError, which is what a
         # disconnected client actually raises here.
         print(f"Couldn't send {message.get('type')!r} to client (already disconnected?): {error}")
-
-
-async def transcribe_segment_and_report(model, writer, audio_bytes, session=None):
-    """
-    Transcribes one closed speech segment in a background thread (keeping
-    the event loop free to keep reading incoming messages), logs the
-    result with a timestamp, and — if it contains real text — sends it to
-    windows_app as a transcript message. If this segment belongs to a
-    still-active session, also feeds the text into that session's rolling
-    context and suggestion trigger (see MeetingSession). `session` is left
-    as None for a segment transcribed after its session has already ended
-    (the trailing bit of audio flushed on session_stopped), so it's
-    reported but doesn't try to trigger a suggestion from a session that no
-    longer exists.
-    """
-    duration_seconds = segment_duration_seconds(audio_bytes)
-    started_at = time.monotonic()
-    text = await asyncio.to_thread(transcribe_audio, model, audio_bytes)
-    elapsed_seconds = time.monotonic() - started_at
-    timestamp = time.strftime("%H:%M:%S")
-    spoken_text = text if text else "(no speech detected)"
-    print(
-        f"[{timestamp}] Transcript ({duration_seconds:.1f}s segment, "
-        f"{elapsed_seconds:.1f}s to transcribe): {spoken_text}"
-    )
-    if text:
-        await send_message(
-            writer, {"type": "transcript", "text": text, "duration_seconds": duration_seconds}
-        )
-        if session is not None:
-            session.add_transcript_segment(text)
-
-
-def handle_finished_segment(model, writer, audio_bytes, session=None):
-    """
-    Decides what to do with one just-closed speech segment: skip
-    transcription entirely if it's too short to plausibly be real speech
-    (a false positive from the speech detector that would otherwise cost a
-    full, slow model call for nothing), or kick off background
-    transcription-and-reporting otherwise. `session` is passed through to
-    transcribe_segment_and_report() — see its docstring.
-    """
-    duration_seconds = segment_duration_seconds(audio_bytes)
-    if duration_seconds < MIN_SEGMENT_SECONDS_TO_TRANSCRIBE:
-        print(f"Skipping {duration_seconds:.2f}s segment: below minimum duration, likely not real speech")
-        return
-    asyncio.create_task(transcribe_segment_and_report(model, writer, audio_bytes, session))
 
 
 class AudioLevelTracker:
@@ -461,12 +225,10 @@ def handle_audio_chunk(tracker, session, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
     one-second stats, and feeds it (converted to the common 16kHz mono
-    format) into the session's speech segmenter. Any speech segment just
-    closed is handed off to handle_finished_segment() along with the
-    session, so a finished transcript can feed the suggestion trigger.
-    Transcribes with whichever Whisper model this session was started with
-    (session.model) — never the manager's current model directly, since
-    that could have moved on to a different size for a later session.
+    format) into the session's streaming transcriber. Actual transcription
+    happens on MeetingSession's own periodic tick (see
+    MeetingSession._run_streaming_ticks), not synchronously here -- this
+    just accumulates audio into the buffer.
     """
     samples = decode_audio_chunk(message)
     if samples is None:
@@ -474,8 +236,7 @@ def handle_audio_chunk(tracker, session, message):
     tracker.record(samples)
 
     audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
-    for segment in session.segmenter.add_audio(audio_bytes):
-        handle_finished_segment(session.model, session.writer, segment, session)
+    session.streaming_transcriber.add_audio_chunk(audio_bytes)
 
 
 def default_settings():
@@ -486,7 +247,6 @@ def default_settings():
     """
     return {
         "mode": DEFAULT_MODE,
-        "whisper_model_size": DEFAULT_WHISPER_MODEL_SIZE,
         "suggestion_pause_seconds": PAUSE_SECONDS_BEFORE_SUGGESTION,
         "context_notes": "",
         "auto_suggest_enabled": True,
@@ -495,11 +255,10 @@ def default_settings():
 
 def settings_from_message(message):
     """
-    Reads mode/whisper_model_size/suggestion_pause_seconds out of a
-    settings_changed message, falling back to default_settings() for any
-    field that's missing OR explicitly sent as null (a plain message.get(
-    key, default) wouldn't catch the null case, since the key would still
-    be present).
+    Reads mode/suggestion_pause_seconds/etc. out of a settings_changed
+    message, falling back to default_settings() for any field that's
+    missing OR explicitly sent as null (a plain message.get(key, default)
+    wouldn't catch the null case, since the key would still be present).
 
     Returns:
         dict: settings in the same shape default_settings() returns.
@@ -516,8 +275,8 @@ async def handle_client(model_manager, reader, writer):
     """
     Services one connected windows_app client for the lifetime of the
     connection: reads newline-delimited JSON messages, replies to pings,
-    tracks audio level stats, and manages the current session's speech
-    segmentation/transcription.
+    tracks audio level stats, and manages the current session's streaming
+    transcription.
 
     A "session" is bounded by explicit session_started/session_stopped
     messages from windows_app. audio_chunk, hotkey_triggered, and
@@ -531,18 +290,18 @@ async def handle_client(model_manager, reader, writer):
     the one setting that's different, since it's meant to be flipped live
     mid-session (see SuggestionTrigger.set_auto_suggest_enabled) rather
     than only taking effect on the next session. Starting a session creates
-    a fresh
-    MeetingSession (fresh speech segmenter, fresh claude CLI process, empty
-    transcript context) using those settings, so no state bleeds across
-    sessions; stopping one force-closes whatever segment is still open so a
-    sentence finished right before stopping isn't silently dropped, then
-    tears the session down. If the connection itself drops mid-session (no
+    a fresh MeetingSession (fresh streaming transcriber, fresh claude CLI
+    process, empty transcript context) using those settings, so no state
+    bleeds across sessions; stopping one flushes whatever transcript text
+    was still tentative (see MeetingSession.close()) so a sentence still
+    settling right as the session stops isn't silently dropped, then tears
+    the session down. If the connection itself drops mid-session (no
     explicit session_stopped), the `finally` block below still tears it
     down, so the claude CLI process it started is never left running with
     nothing using it.
 
-    If starting a session fails (e.g. the requested Whisper model size
-    can't load), no MeetingSession is created and a session_start_failed
+    If starting a session fails (e.g. the claude CLI process can't be
+    started), no MeetingSession is created and a session_start_failed
     message is sent back instead of just dropping the connection, so
     windows_app can revert its UI to a clean pre-session state rather than
     getting stuck showing a session as active.
@@ -564,7 +323,6 @@ async def handle_client(model_manager, reader, writer):
                 settings = pending_settings or default_settings()
                 attempt_id = message.get("attempt_id")
                 try:
-                    await model_manager.ensure_model_size(settings["whisper_model_size"])
                     new_session = MeetingSession(
                         writer,
                         model_manager.model,
@@ -584,14 +342,10 @@ async def handle_client(model_manager, reader, writer):
                     session = new_session
                     print(
                         f"Session started (mode={settings['mode']}, "
-                        f"whisper_model={settings['whisper_model_size']}, "
                         f"suggestion_pause={settings['suggestion_pause_seconds']}s)"
                     )
             elif message_type == "session_stopped":
                 if session is not None:
-                    leftover_audio = session.segmenter.close_open_segment()
-                    if leftover_audio is not None:
-                        handle_finished_segment(session.model, session.writer, leftover_audio)
                     await session.close()
                     session = None
                 print("Session stopped")
@@ -922,29 +676,31 @@ class MeetingSession:
     """
     Everything that lives for the span of one meeting session — from
     session_started to session_stopped — and needs to be created fresh
-    each time and cleanly torn down together: speech segmentation, the
+    each time and cleanly torn down together: streaming transcription, the
     running claude CLI process behind it, the pause/hotkey suggestion
-    trigger, and a short rolling history of recent transcript segments to
-    give suggestions context. If the claude CLI process crashes mid-session,
-    one restart is attempted automatically (see _ask_with_restart_on_crash)
-    — recent_transcript_segments lives here, not in ClaudeCli, so a restart
-    doesn't lose the transcript context built up so far.
+    trigger, and a short rolling history of recent committed transcript
+    text to give suggestions context. If the claude CLI process crashes
+    mid-session, one restart is attempted automatically (see
+    _ask_with_restart_on_crash) — recent_transcript_segments lives here,
+    not in ClaudeCli, so a restart doesn't lose the transcript context
+    built up so far.
     """
 
     def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=True):
         """
         Starts a fresh session using the settings captured for it at
-        session_started (see handle_client): new segmenter, `model` as the
-        Whisper model this session transcribes with for its entire
-        lifetime, a new claude CLI process framed for `mode` and
-        `context_notes`, empty transcript history, and a suggestion trigger
-        using `pause_seconds` and starting with auto-suggest set to
-        `auto_suggest_enabled`.
+        session_started (see handle_client): a new StreamingTranscriber
+        using `model` (always base.en — see WhisperModelManager), a new
+        claude CLI process framed for `mode` and `context_notes`, empty
+        transcript history, and a suggestion trigger using `pause_seconds`
+        and starting with auto-suggest set to `auto_suggest_enabled`. Also
+        starts the periodic tick that drives streaming transcription for
+        the life of this session (see _run_streaming_ticks).
         """
         self.writer = writer
-        self.model = model
-        self.segmenter = VoiceSegmenter()
+        self.streaming_transcriber = StreamingTranscriber(model)
         self.recent_transcript_segments = []
+        self._last_sent_tentative_text = ""
         self._system_prompt = build_system_prompt(mode, context_notes)
         print(f"Starting claude CLI process for this session (mode: {mode})...")
         self._claude_cli = ClaudeCli(self._system_prompt)
@@ -956,10 +712,73 @@ class MeetingSession:
         # the pause timer or the hotkey is still using it.
         self._claude_cli_lock = asyncio.Lock()
         self.trigger = SuggestionTrigger(self._generate_and_send_suggestion, pause_seconds, auto_suggest_enabled)
+        self._stop_ticking = asyncio.Event()
+        self._tick_task = asyncio.create_task(self._run_streaming_ticks())
 
     def set_auto_suggest_enabled(self, enabled):
         """Turns this session's pause-triggered suggestions on or off, live. See SuggestionTrigger.set_auto_suggest_enabled."""
         self.trigger.set_auto_suggest_enabled(enabled)
+
+    async def _run_streaming_ticks(self):
+        """
+        Runs for the life of the session: every
+        PARTIAL_UPDATE_INTERVAL_SECONDS, re-transcribes the streaming
+        buffer and reports whatever's newly committed or currently
+        tentative back to windows_app. Replaces the old VAD-close-then-
+        transcribe-whole-segment flow (Phase 2.5, Day 17) — see
+        wsl_app/research/day16/README.md for why this cadence is the
+        honest ceiling on this hardware.
+
+        Stops cooperatively via self._stop_ticking (see close()) rather
+        than asyncio.Task.cancel(): cancelling a task that's mid-await on
+        asyncio.to_thread() doesn't actually stop the underlying worker
+        thread — already-running executor work can't be cancelled — so a
+        hard cancel risked close() moving on to flush the transcript while
+        a tick's own worker thread was still mutating the same
+        StreamingTranscriber state underneath it. Waiting on
+        self._stop_ticking instead means a tick already in flight always
+        finishes and reports normally before the loop exits. Found in
+        code review, Day 17.
+
+        Wrapped in try/except so one bad tick (e.g. a transient
+        faster-whisper error) can't silently kill transcription for the
+        rest of the session — every other background loop in this file
+        already survives its own failures (see _ask_with_restart_on_crash,
+        send_message); this one hadn't. Also found in code review.
+        """
+        while not self._stop_ticking.is_set():
+            try:
+                await asyncio.wait_for(self._stop_ticking.wait(), timeout=PARTIAL_UPDATE_INTERVAL_SECONDS)
+            except asyncio.TimeoutError:
+                pass
+            if self._stop_ticking.is_set():
+                break
+            try:
+                committed_text, tentative_text = await asyncio.to_thread(self.streaming_transcriber.process_tick)
+            except Exception as error:
+                print(f"Error during a streaming transcription tick (skipping this tick): {error}")
+                continue
+            await self._report_streaming_result(committed_text, tentative_text)
+
+    async def _report_streaming_result(self, committed_text, tentative_text):
+        """
+        Sends whatever changed this tick to windows_app as transcript
+        messages (is_final=True for newly committed text, is_final=False
+        for the current tentative guess, only re-sent when it actually
+        changed), and feeds newly committed text into the rolling
+        suggestion context/pause trigger. Tentative text is shown but
+        never used for suggestions or context, since it may still be
+        revised — Day 16 measured a 68-95% revision rate before a word
+        settles.
+        """
+        if committed_text:
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"[{timestamp}] Committed: {committed_text}")
+            await send_message(self.writer, {"type": "transcript", "text": committed_text, "is_final": True})
+            self.add_transcript_segment(committed_text)
+        if tentative_text != self._last_sent_tentative_text:
+            self._last_sent_tentative_text = tentative_text
+            await send_message(self.writer, {"type": "transcript", "text": tentative_text, "is_final": False})
 
     def add_transcript_segment(self, text):
         """
@@ -1076,11 +895,23 @@ class MeetingSession:
 
     async def close(self):
         """
-        Ends the session: cancels any pending suggestion timer, waits for
-        any suggestion currently being generated to finish (so the claude
-        CLI process's stdin is never closed out from under an in-flight
-        ask()), then stops the process on a background thread.
+        Ends the session: signals the streaming-transcription tick loop to
+        stop, waiting for any tick already in flight to finish normally
+        first (see _run_streaming_ticks), then runs one final
+        retranscription pass plus flushes whatever's still tentative as
+        one last committed transcript message, cancels any pending
+        suggestion timer, waits for any suggestion currently being
+        generated to finish (so the claude CLI process's stdin is never
+        closed out from under an in-flight ask()), then stops the process
+        on a background thread.
         """
+        self._stop_ticking.set()
+        await self._tick_task
+        final_text = await asyncio.to_thread(self.streaming_transcriber.finish)
+        if final_text:
+            timestamp = time.strftime("%H:%M:%S")
+            print(f"[{timestamp}] Committed (final flush): {final_text}")
+            await send_message(self.writer, {"type": "transcript", "text": final_text, "is_final": True})
         self.trigger.stop()
         async with self._claude_cli_lock:
             await asyncio.to_thread(self._claude_cli.stop)

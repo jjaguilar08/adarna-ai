@@ -79,8 +79,6 @@ MODE_LABELS_TO_VALUES = {
     "Interview": "interview",
 }
 
-WHISPER_MODEL_SIZES = ["small.en", "base.en"]
-
 SUGGESTION_PAUSE_PRESETS_SECONDS = [0.8, 1.2, 1.6, 2.0]
 # Picked from the presets list itself (rather than a separate literal) so
 # it can never drift out of sync with it -- 1.2s matches Day 7's default.
@@ -112,7 +110,7 @@ class WslConnection(QObject):
     """
 
     connection_changed = Signal(bool)
-    transcript_received = Signal(str)
+    transcript_received = Signal(str, bool)
     suggestion_received = Signal(str)
     session_start_failed_received = Signal(str, int)
 
@@ -167,12 +165,16 @@ class WslConnection(QObject):
         long as the connection stays open, dispatching each by its "type".
         Pongs are just the ping heartbeat's reply (nothing to do);
         transcripts and suggestions are forwarded to their own signal for
-        the UI to display; session_start_failed is forwarded so the UI can
-        revert out of the "session active" state it optimistically entered
-        when Start Session was pressed — its attempt_id is the same value
-        sent on the session_started message it's responding to, echoed back
-        so the UI can tell a stale failure (for an attempt already
-        abandoned in favor of a newer one) from a current one.
+        the UI to display -- a transcript's is_final flag (Day 17)
+        distinguishes text that's now locked in from a still-changing
+        partial guess, forwarded to TranscriptDisplay as a second signal
+        argument so the pane can render each differently; session_start_failed
+        is forwarded so the UI can revert out of the "session active" state
+        it optimistically entered when Start Session was pressed — its
+        attempt_id is the same value sent on the session_started message
+        it's responding to, echoed back so the UI can tell a stale failure
+        (for an attempt already abandoned in favor of a newer one) from a
+        current one.
         """
         while True:
             line = self._connection.readline()
@@ -180,7 +182,7 @@ class WslConnection(QObject):
                 raise OSError("wsl_app closed the connection")
             message = json.loads(line)
             if message.get("type") == "transcript":
-                self.transcript_received.emit(message["text"])
+                self.transcript_received.emit(message["text"], bool(message.get("is_final", True)))
             elif message.get("type") == "suggestion":
                 self.suggestion_received.emit(message["text"])
             elif message.get("type") == "session_start_failed":
@@ -555,14 +557,76 @@ def create_readonly_text_pane(layout):
 
 def create_transcript_pane(layout):
     """
-    Adds a labeled, scrolling, read-only pane that displays each transcript
-    as it arrives from wsl_app.
+    Adds a labeled, scrolling, read-only pane that displays the transcript
+    as it arrives from wsl_app. See TranscriptDisplay for how committed vs.
+    tentative text (Day 17) are kept in sync with this pane.
 
     Returns:
-        QPlainTextEdit: the pane to append new transcript text to.
+        QPlainTextEdit: the pane to keep in sync with incoming transcript text.
     """
     layout.addWidget(QLabel("Transcript"))
     return create_readonly_text_pane(layout)
+
+
+class TranscriptDisplay(QObject):
+    """
+    Keeps the transcript pane showing all committed (locked-in) text so
+    far, plus whatever's currently tentative appended at the end --
+    replaced in place each time a new partial arrives, rather than
+    appended, so a still-settling partial doesn't pile up
+    duplicate/superseded text on the pane (Phase 2.5, Day 17 -- see
+    wsl_app/streaming_transcriber.py). A QObject (not a plain class) so
+    wsl_connection.transcript_received -- emitted from WslConnection's
+    background reader thread -- can be connected to update() as a real
+    cross-thread queued connection, per this project's own hard-won lesson
+    about lambdas having no owning QObject for Qt to marshal through (see
+    OverlayToggle).
+    """
+
+    def __init__(self, pane):
+        """Stores the pane to keep in sync, starting with nothing committed or tentative yet."""
+        super().__init__()
+        self._pane = pane
+        self._committed_text = ""
+        self._tentative_text = ""
+
+    def update(self, text, is_final):
+        """
+        Folds one incoming transcript message into the running display: a
+        final message's text is appended permanently to the committed
+        transcript and the tentative text is cleared (it's now been
+        superseded by a committed result); a non-final message's text
+        replaces whatever tentative text was showing, in place.
+        """
+        if is_final:
+            self._committed_text = f"{self._committed_text} {text}" if self._committed_text else text
+            self._tentative_text = ""
+        else:
+            self._tentative_text = text
+        self._render()
+
+    def reset(self):
+        """
+        Clears all committed and tentative text -- call when a new session
+        starts, so the pane doesn't keep showing a previous session's
+        transcript with the new one appended right after it (found in code
+        review, Day 17: this gap predates today's change, but streaming's
+        continuous partial updates make it far more visible than the old
+        sparse per-segment appends did).
+        """
+        self._committed_text = ""
+        self._tentative_text = ""
+        self._render()
+
+    def _render(self):
+        """Rewrites the pane's full text from committed + tentative state, and scrolls to the end so new/updating text stays visible."""
+        full_text = self._committed_text
+        if self._tentative_text:
+            full_text = f"{full_text} {self._tentative_text}" if full_text else self._tentative_text
+        self._pane.setPlainText(full_text)
+        cursor = self._pane.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        self._pane.setTextCursor(cursor)
 
 
 class LatestSuggestion(QObject):
@@ -652,6 +716,18 @@ def create_overlay_window():
     return window, pane
 
 
+def create_transcript_display(transcript_pane):
+    """
+    Creates the TranscriptDisplay that keeps transcript_pane in sync with
+    incoming committed/tentative transcript messages.
+
+    Returns:
+        TranscriptDisplay: connect wsl_connection.transcript_received to
+        its update() method (see connect_incoming_messages_to_ui()).
+    """
+    return TranscriptDisplay(transcript_pane)
+
+
 def create_overlay_toggle(overlay_window):
     """
     Creates the OverlayToggle that the show/hide hotkey uses to flip
@@ -721,17 +797,23 @@ def create_suggestion_trigger_controls(layout):
 
 def create_settings_panel(layout):
     """
-    Adds a labeled settings panel with the mode, Whisper model size,
-    suggestion pause delay, and pre-session context notes controls used to
-    configure the next session. These values are only read (and sent to
-    wsl_app) when Start Session is pressed — see create_session_controls()
-    — so changing them mid-session has no effect until the next session
-    starts.
+    Adds a labeled settings panel with the mode, suggestion pause delay,
+    and pre-session context notes controls used to configure the next
+    session. These values are only read (and sent to wsl_app) when Start
+    Session is pressed — see create_session_controls() — so changing them
+    mid-session has no effect until the next session starts.
+
+    No Whisper model size control here anymore (Day 17): the live
+    streaming transcript path is structurally tied to base.en (see
+    wsl_app/streaming_transcriber.py) -- small.en's own per-call decode
+    floor is already slower than the cadence streaming needs, so there's
+    no real choice left to expose, and wsl_app no longer reads a
+    whisper_model_size setting at all.
 
     Returns:
-        tuple[QComboBox, QComboBox, QComboBox, QPlainTextEdit]: the mode,
-        Whisper model size, and suggestion pause dropdowns, plus the
-        context notes text box, in that order.
+        tuple[QComboBox, QComboBox, QPlainTextEdit]: the mode and
+        suggestion pause dropdowns, plus the context notes text box, in
+        that order.
     """
     group = QGroupBox("Session Settings")
     form = QFormLayout(group)
@@ -740,11 +822,6 @@ def create_settings_panel(layout):
     for label in MODE_LABELS_TO_VALUES:
         mode_dropdown.addItem(label)
     form.addRow("Mode:", mode_dropdown)
-
-    whisper_model_dropdown = QComboBox()
-    for size in WHISPER_MODEL_SIZES:
-        whisper_model_dropdown.addItem(size)
-    form.addRow("Whisper model:", whisper_model_dropdown)
 
     pause_dropdown = QComboBox()
     for seconds in SUGGESTION_PAUSE_PRESETS_SECONDS:
@@ -762,10 +839,10 @@ def create_settings_panel(layout):
     form.addRow("Context notes:", context_notes_edit)
 
     layout.addWidget(group)
-    return mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit
+    return mode_dropdown, pause_dropdown, context_notes_edit
 
 
-def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox):
+def current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox):
     """
     Reads the settings panel's current values and packages them into the
     settings_changed message to send wsl_app.
@@ -776,7 +853,6 @@ def current_settings_message(mode_dropdown, whisper_model_dropdown, pause_dropdo
     return {
         "type": "settings_changed",
         "mode": MODE_LABELS_TO_VALUES[mode_dropdown.currentText()],
-        "whisper_model_size": whisper_model_dropdown.currentText(),
         "suggestion_pause_seconds": pause_dropdown.currentData(),
         "context_notes": context_notes_edit.toPlainText().strip(),
         "auto_suggest_enabled": auto_suggest_checkbox.isChecked(),
@@ -819,17 +895,19 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
 
 
 def connect_incoming_messages_to_ui(
-    wsl_connection, transcript_pane, suggestions_pane, latest_suggestion, overlay_pane
+    wsl_connection, transcript_display, suggestions_pane, latest_suggestion, overlay_pane
 ):
     """
-    Wires wsl_app's incoming transcript/suggestion messages to the UI: each
-    transcript segment is appended to the transcript pane, each suggestion
+    Wires wsl_app's incoming transcript/suggestion messages to the UI:
+    each transcript message updates the transcript pane via
+    transcript_display (committed text appended permanently, tentative
+    text replaced in place -- see TranscriptDisplay), each suggestion
     replaces whatever the suggestions pane and the overlay pane currently
     show (both render the same incoming suggestion text -- no protocol
     change needed for the overlay), and latest_suggestion is kept in sync
     so the Copy button always has something current to copy.
     """
-    wsl_connection.transcript_received.connect(transcript_pane.appendPlainText)
+    wsl_connection.transcript_received.connect(transcript_display.update)
     wsl_connection.suggestion_received.connect(suggestions_pane.setPlainText)
     wsl_connection.suggestion_received.connect(overlay_pane.setPlainText)
     wsl_connection.suggestion_received.connect(latest_suggestion.update)
@@ -957,29 +1035,32 @@ def create_session_controls(
     wsl_connection,
     capture_manager,
     mode_dropdown,
-    whisper_model_dropdown,
     pause_dropdown,
     context_notes_edit,
     auto_suggest_checkbox,
+    transcript_display,
     layout,
     window,
 ):
     """
     Adds the Start Session / Stop Session buttons and wires them up:
-    starting sends the settings panel's current values (including the
-    context notes and the auto-suggest checkbox's starting state) as
-    settings_changed, then session_started (tagged with a fresh
-    attempt_id — see handle_session_start_failed), and starts audio
-    capture; stopping sends session_stopped and stops it. Button
-    enabled-state tracks which action is currently valid.
+    starting clears the transcript pane (see TranscriptDisplay.reset —
+    Day 17: otherwise a new session's transcript would appear appended
+    right after whatever the previous one left on screen), sends the
+    settings panel's current values (including the context notes and the
+    auto-suggest checkbox's starting state) as settings_changed, then
+    session_started (tagged with a fresh attempt_id — see
+    handle_session_start_failed), and starts audio capture; stopping
+    sends session_stopped and stops it. Button enabled-state tracks which
+    action is currently valid.
 
     Also handles three ways a session can end itself, all reverting to the
     same clean pre-session UI state stop_session() reaches (see
     end_session()): wsl_app reporting it couldn't start the session at all
-    (session_start_failed — e.g. a Whisper model reload failure), the
-    wsl_app connection dropping mid-session, and the local audio capture
-    stream itself failing mid-session (e.g. the Windows audio device
-    disappeared or changed).
+    (session_start_failed — e.g. the claude CLI process failing to start),
+    the wsl_app connection dropping mid-session, and the local audio
+    capture stream itself failing mid-session (e.g. the Windows audio
+    device disappeared or changed).
     """
     start_button, stop_button = create_session_buttons(layout)
     current_attempt_id = 0
@@ -1008,13 +1089,12 @@ def create_session_controls(
         revert_to_pre_session_state()
 
     def start_session():
-        """Begins a session: sends the current settings, notifies wsl_app, starts capture, and flips button state."""
+        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture, and flips button state."""
         nonlocal current_attempt_id
         current_attempt_id += 1
+        transcript_display.reset()
         wsl_connection.send_message(
-            current_settings_message(
-                mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox
-            )
+            current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox)
         )
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
         capture_manager.start_capture()
@@ -1088,9 +1168,10 @@ def main():
     status_label = create_connection_status_label(layout)
     device_dropdown = create_device_dropdown(layout)
     capture_status_label = create_capture_status_label(layout)
-    mode_dropdown, whisper_model_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
+    mode_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
+    transcript_display = create_transcript_display(transcript_pane)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
     overlay_window, overlay_pane = create_overlay_window()
 
@@ -1100,7 +1181,9 @@ def main():
     populate_device_dropdown(device_dropdown, devices, default_device)
 
     wsl_connection = start_wsl_connection(status_label)
-    connect_incoming_messages_to_ui(wsl_connection, transcript_pane, suggestions_pane, latest_suggestion, overlay_pane)
+    connect_incoming_messages_to_ui(
+        wsl_connection, transcript_display, suggestions_pane, latest_suggestion, overlay_pane
+    )
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     capture_manager = create_audio_capture_manager(
         audio, wsl_connection, device_dropdown, default_device, capture_status_label
@@ -1109,10 +1192,10 @@ def main():
         wsl_connection,
         capture_manager,
         mode_dropdown,
-        whisper_model_dropdown,
         pause_dropdown,
         context_notes_edit,
         auto_suggest_checkbox,
+        transcript_display,
         layout,
         window,
     )
