@@ -9,12 +9,13 @@ from pathlib import Path
 
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -22,6 +23,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QScrollBar,
+    QSizeGrip,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -84,6 +89,24 @@ SUGGESTION_PAUSE_PRESETS_SECONDS = [0.8, 1.2, 1.6, 2.0]
 # it can never drift out of sync with it -- 1.2s matches Day 7's default.
 DEFAULT_SUGGESTION_PAUSE_SECONDS = SUGGESTION_PAUSE_PRESETS_SECONDS[1]
 
+# Overlay visual redesign (Day 18), styled to match a real ParakeetAI
+# screenshot shared as a reference: a dark, semi-transparent, rounded
+# panel rather than a bare default Qt widget. Colors/spacing are a
+# by-eye match for "the same feel," not a pixel-exact clone.
+OVERLAY_BACKGROUND_COLOR = "rgba(24, 24, 28, 235)"
+OVERLAY_BORDER_COLOR = "rgba(255, 255, 255, 30)"
+OVERLAY_CAPTION_COLOR = "rgba(255, 255, 255, 140)"
+OVERLAY_QUESTION_COLOR = "rgba(255, 255, 255, 205)"
+OVERLAY_ANSWER_COLOR = "#F5F5F7"
+
+# Range and default for the overlay opacity slider (see
+# create_overlay_controls()), in whole percent. Floored well above 0 so
+# the overlay can never be slid all the way to fully invisible with no
+# obvious way back.
+OVERLAY_OPACITY_MIN_PERCENT = 20
+OVERLAY_OPACITY_MAX_PERCENT = 100
+OVERLAY_OPACITY_DEFAULT_PERCENT = 90
+
 
 def load_port():
     """
@@ -111,7 +134,7 @@ class WslConnection(QObject):
 
     connection_changed = Signal(bool)
     transcript_received = Signal(str, bool)
-    suggestion_received = Signal(str)
+    suggestion_received = Signal(str, str)
     session_start_failed_received = Signal(str, int)
 
     def __init__(self):
@@ -168,7 +191,14 @@ class WslConnection(QObject):
         the UI to display -- a transcript's is_final flag (Day 17)
         distinguishes text that's now locked in from a still-changing
         partial guess, forwarded to TranscriptDisplay as a second signal
-        argument so the pane can render each differently; session_start_failed
+        argument so the pane can render each differently; a suggestion's
+        "question" field (Day 18) carries the transcript excerpt that
+        prompted it, forwarded as suggestion_received's first argument
+        (empty string if absent OR explicitly null) so the overlay can
+        show it above the answer -- QLabel.setText() requires a real str,
+        so a bare `or ""` guard is needed, not just .get()'s own default,
+        since .get()'s default only kicks in when the key is missing
+        entirely, not when it's present but explicitly null; session_start_failed
         is forwarded so the UI can revert out of the "session active" state
         it optimistically entered when Start Session was pressed — its
         attempt_id is the same value sent on the session_started message
@@ -184,7 +214,7 @@ class WslConnection(QObject):
             if message.get("type") == "transcript":
                 self.transcript_received.emit(message["text"], bool(message.get("is_final", True)))
             elif message.get("type") == "suggestion":
-                self.suggestion_received.emit(message["text"])
+                self.suggestion_received.emit(message.get("question") or "", message["text"])
             elif message.get("type") == "session_start_failed":
                 self.session_start_failed_received.emit(
                     message.get("reason", "Unknown error"), message.get("attempt_id", -1)
@@ -543,8 +573,11 @@ def create_session_buttons(layout):
 def create_readonly_text_pane(layout):
     """
     Adds a scrolling, read-only text pane to layout -- the shared shape
-    behind the transcript pane, the suggestions pane, and the overlay's
-    pane, so the three don't each hand-roll the same three lines.
+    behind the transcript pane and the suggestions pane, so the two don't
+    each hand-roll the same three lines. Not used by the overlay (Day 18):
+    OverlayWindow's question/answer text needs its own styled QLabels
+    instead, both for the visual redesign and so a click on top of the
+    text still drags the window (see OverlayWindow._add_labeled_section).
 
     Returns:
         QPlainTextEdit: the pane, already added to layout.
@@ -633,12 +666,14 @@ class LatestSuggestion(QObject):
     """
     Remembers the most recently received suggestion text, so the "Copy
     Latest Suggestion" button can read it without needing its own
-    connection to wsl_app. A QObject (not a plain class) specifically so
-    that connecting suggestion_received.update to it is a proper
-    cross-thread queued connection, same as every other signal in this
-    file that crosses from a background thread to the GUI thread — a plain
-    object would make Qt call update() directly on WslConnection's
-    background reader thread instead.
+    connection to wsl_app. update() is called from SuggestionDisplay.update
+    (Day 18), itself the direct target of WslConnection's cross-thread
+    suggestion_received signal -- by the time it reaches here, the call is
+    already running on the GUI thread, so this class no longer needs to be
+    a QObject for thread-safety on its own account. Left as one anyway:
+    it's a trivial, harmless thing to be, and downgrading it to a plain
+    class would be a change worth making for its own sake, not one this
+    diff should fold in incidentally.
     """
 
     def __init__(self):
@@ -649,6 +684,34 @@ class LatestSuggestion(QObject):
     def update(self, text):
         """Stores `text` as the latest suggestion."""
         self.text = text
+
+
+class SuggestionDisplay(QObject):
+    """
+    Fans out one incoming suggestion to everywhere it's shown: the main
+    window's pane and the Copy button's tracker get the answer text only
+    (see main()'s docstring for why the question stays overlay-only), while
+    the overlay gets both the question and the answer, rendered in its
+    separate labels (Day 18 -- see OverlayWindow.update_suggestion). A
+    QObject with a bound-method slot, not a lambda, for the same
+    cross-thread reason as LatestSuggestion above: suggestion_received is
+    emitted from WslConnection's background reader thread, and a lambda has
+    no owning QObject for Qt to marshal the call through safely (see
+    OverlayToggle.toggle for the fuller explanation of that rule).
+    """
+
+    def __init__(self, suggestions_pane, latest_suggestion, overlay_window):
+        """Stores the three things one incoming suggestion needs to update."""
+        super().__init__()
+        self._suggestions_pane = suggestions_pane
+        self._latest_suggestion = latest_suggestion
+        self._overlay_window = overlay_window
+
+    def update(self, question, answer):
+        """Updates the main pane and Copy-button tracker with the answer, and the overlay with both the question and the answer."""
+        self._suggestions_pane.setPlainText(answer)
+        self._latest_suggestion.update(answer)
+        self._overlay_window.update_suggestion(question, answer)
 
 
 class OverlayToggle(QObject):
@@ -685,35 +748,400 @@ class OverlayToggle(QObject):
         self._overlay_window.setVisible(not self._overlay_window.isVisible())
 
 
+class OverlayWindow(QWidget):
+    """
+    The always-on-top overlay: frameless, stays above other windows, and
+    shows the transcript excerpt that prompted the latest suggestion
+    (the "question") above the suggestion itself (the "answer") -- per
+    PRD §8 Phase 2's Day 18 visual redesign, matching a real ParakeetAI
+    screenshot shared as a reference (dark, semi-transparent, rounded
+    panel; no transcript, no settings, no session controls -- those all
+    stay on the main window). Starts hidden; create_overlay_toggle()
+    wires up the hotkey that shows it.
+
+    A real class (not a plain QWidget built by a factory function, like
+    every other widget in this file) because dragging and the rounded/
+    translucent look both need virtual methods overridden
+    (mousePressEvent/mouseMoveEvent/mouseReleaseEvent, paintEvent's
+    stylesheet painting) -- Qt's normal way of doing this is a subclass,
+    not event wiring bolted onto a generic QWidget.
+
+    WA_QuitOnClose is turned off specifically so this window doesn't
+    count toward Qt's "quit once every counted window is closed" check --
+    without this, closing the main window while the overlay happens to
+    still be visible would leave the app running invisibly, since the
+    overlay would still be an open, counted window.
+    """
+
+    def __init__(self):
+        """Builds the frameless, translucent, rounded overlay panel and its question/answer labels, starting hidden with no drag in progress."""
+        super().__init__()
+        self.setWindowTitle("Adarna Overlay")
+        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.setAttribute(Qt.WA_QuitOnClose, False)
+        # Both needed together for a rounded, see-through-cornered panel:
+        # WA_TranslucentBackground makes the whole window surface support
+        # alpha (so the corners outside the rounded rect are truly
+        # see-through, not just black); WA_StyledBackground makes a plain
+        # QWidget actually paint its stylesheet's background/border-radius
+        # at all, which it otherwise skips by default.
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setStyleSheet(
+            f"OverlayWindow {{"
+            f"  background-color: {OVERLAY_BACKGROUND_COLOR};"
+            f"  border: 1px solid {OVERLAY_BORDER_COLOR};"
+            f"  border-radius: 14px;"
+            f"}}"
+        )
+        self.setMinimumSize(260, 140)
+        self._drag_offset = None
+
+        outer_layout = QVBoxLayout(self)
+        outer_layout.setContentsMargins(16, 14, 16, 10)
+        outer_layout.setSpacing(4)
+
+        scroll_row = QHBoxLayout()
+        scroll_row.setSpacing(2)
+        scroll_area = self._build_scroll_area()
+        scroll_row.addWidget(scroll_area)
+        scroll_row.addWidget(self._build_external_scrollbar(scroll_area))
+        outer_layout.addLayout(scroll_row)
+
+        grip_row = QHBoxLayout()
+        grip_row.addStretch()
+        grip = QSizeGrip(self)
+        grip.setStyleSheet("background: transparent;")
+        grip_row.addWidget(grip)
+        outer_layout.addLayout(grip_row)
+
+        # One reused single-shot timer for _sync_scroll_content_width
+        # (see resizeEvent()), rather than a fresh QTimer.singleShot(0, ...)
+        # per resize event -- dragging the QSizeGrip fires many resizeEvent
+        # calls in quick succession (one per intermediate geometry change),
+        # and re-starting an already-pending single-shot timer just pushes
+        # its fire time out rather than queuing a second one, so only the
+        # last resize in a burst actually triggers a resync. Found by
+        # /code-review, Day 18.
+        self._scroll_width_sync_timer = QTimer(self)
+        self._scroll_width_sync_timer.setSingleShot(True)
+        self._scroll_width_sync_timer.setInterval(0)
+        self._scroll_width_sync_timer.timeout.connect(self._sync_scroll_content_width)
+
+        # Sized last, once self._scroll_area/self._scroll_content exist --
+        # resize() fires resizeEvent() immediately, which reads both (see
+        # resizeEvent()'s docstring).
+        self.resize(440, 240)
+
+    def _build_scroll_area(self):
+        """
+        Builds the scrollable content area holding the question and answer
+        sections. A real QScrollArea, not just word-wrapped labels left to
+        grow the window -- an earlier version tried growing the window to
+        fit instead, but that had no ceiling (a long enough question could
+        grow the overlay taller than the screen) and gave no way to recover
+        text if the user shrank the window smaller than the current content
+        needed (/code-review, Day 18: confirmed empirically that a plain
+        QLabel just silently stops drawing text past its allocated rect,
+        with no scrollbar or indicator anything is missing). A scroll area
+        fixes both at once: content that doesn't fit is always reachable by
+        scrolling, no matter how long the text or how small the user drags
+        the window, and the window's own size goes back to being purely
+        user-controlled (drag/resize), not something update_suggestion()
+        also reaches in and changes.
+
+        Its background and its viewport's background are set transparent
+        so the dark rounded panel painted on the window itself (see
+        __init__) shows through underneath. Both the scroll area itself
+        and its viewport are set mouse-transparent for the same
+        drag-anywhere reason the question and answer labels are (see
+        _add_labeled_section) -- setting only the viewport is not enough:
+        confirmed empirically (/code-review, Day 18) via childAt(), the
+        same lookup Qt's real event dispatch uses to route a click, that
+        (depending on the overlay's exact size and content at the time --
+        it wasn't even consistent) a click landing on the
+        viewport-transparent-but-not-itself-transparent QScrollArea could
+        still resolve to the QScrollArea widget itself rather than the
+        window underneath. QScrollArea has no drag handling of its own, so
+        those clicks would have silently gone nowhere instead of starting
+        a drag.
+
+        Both its own scrollbars are turned off (including the vertical
+        one, normally the whole point of a scroll area) -- see
+        _build_external_scrollbar() for why, and for the real, always-
+        clickable scrollbar that replaces it.
+
+        Trade-off worth knowing about: making this whole subtree
+        mouse-transparent means the mouse wheel no longer scrolls it
+        either -- wheel events go through the same hit-testing as clicks,
+        so they pass through untouched the same way a click does, rather
+        than reaching the scroll area. The external scrollbar (see
+        _build_external_scrollbar()) is what actually guarantees overflow
+        content stays reachable, not the wheel -- a real test of "does
+        long content stay reachable" should drag that scrollbar, not
+        assume the wheel works.
+
+        Note for anyone tempted to remove one of the WA_TransparentForMouseEvents
+        calls in this method or _add_labeled_section() as apparent
+        copy-paste: each is independently load-bearing. Qt's hit-testing
+        recurses to the deepest widget under the cursor and only skips
+        levels actually marked transparent -- a real widget (a label, the
+        content container) still catches a click on its own area even
+        when an ancestor above it (the viewport, the scroll area) is
+        already transparent. Removing any one layer reintroduces a dead
+        zone for drag right where that specific widget sits, not
+        elsewhere -- confirmed by testing each layer's contribution via
+        childAt() during Day 18's review, not assumed.
+
+        Returns:
+            QScrollArea: ready to add to the window's layout.
+        """
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setStyleSheet("background: transparent; border: none;")
+        scroll_area.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        scroll_area.viewport().setStyleSheet("background: transparent;")
+        scroll_area.viewport().setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # setWidgetResizable(True) alone doesn't reliably let a
+        # height-for-width widget (word-wrapped QLabels) grow taller than
+        # the viewport -- confirmed empirically (/code-review, Day 18): it
+        # just clamped the content widget to the viewport's exact size
+        # instead of scrolling, even though the labels' own
+        # heightForWidth() said they needed much more room. Pinning the
+        # content widget's width to the viewport's current width (see
+        # resizeEvent()) forces its height to come from its own
+        # sizeHint() at that fixed width instead, which is what actually
+        # lets the scroll area detect the overflow and become scrollable.
+        self._scroll_area = scroll_area
+
+        content = QWidget()
+        content.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(2)
+
+        self._question_label = self._add_labeled_section(content_layout, "QUESTION", OVERLAY_QUESTION_COLOR)
+        content_layout.addSpacing(8)
+        self._answer_label = self._add_labeled_section(
+            content_layout, "SUGGESTED RESPONSE", OVERLAY_ANSWER_COLOR
+        )
+        content_layout.addStretch()
+
+        scroll_area.setWidget(content)
+        self._scroll_content = content
+        return scroll_area
+
+    def _build_external_scrollbar(self, scroll_area):
+        """
+        Builds a real, always-clickable vertical scrollbar to sit beside
+        the scroll area, kept in sync with its scroll position in both
+        directions. scroll_area's own built-in vertical scrollbar is
+        turned off entirely (see _build_scroll_area()) rather than used
+        directly, because it lives inside the now-fully-mouse-transparent
+        scroll_area subtree and would be just as unreachable to a real
+        click as everything else in there -- confirmed empirically via
+        childAt(), the same lookup Qt's real event dispatch uses to route
+        a click (/code-review, Day 18): making scroll_area itself
+        mouse-transparent, needed for reliable drag-anywhere everywhere on
+        the overlay (see _build_scroll_area()'s docstring), also makes
+        Qt's hit-testing skip its own internal scrollbar, not just the
+        content above it -- a visible scrollbar nobody could actually
+        click. This one is a plain sibling widget instead, entirely
+        outside that transparent subtree, so it's always independently
+        draggable regardless of drag-through settings elsewhere on the
+        overlay -- the actual guarantee behind "content that doesn't fit
+        is always reachable," not just a scrollbar that merely looks like
+        one.
+
+        Returns:
+            QScrollBar: ready to add next to the scroll area.
+        """
+        inner_scrollbar = scroll_area.verticalScrollBar()
+        scrollbar = QScrollBar(Qt.Vertical)
+        scrollbar.setRange(inner_scrollbar.minimum(), inner_scrollbar.maximum())
+        scrollbar.setStyleSheet("background: transparent;")
+        inner_scrollbar.rangeChanged.connect(scrollbar.setRange)
+        inner_scrollbar.valueChanged.connect(scrollbar.setValue)
+        scrollbar.valueChanged.connect(inner_scrollbar.setValue)
+        return scrollbar
+
+    def _add_labeled_section(self, layout, caption_text, text_color):
+        """
+        Adds one caption ("QUESTION" / "SUGGESTED RESPONSE") plus a
+        word-wrapped text label beneath it to `layout`. Both are set
+        mouse-transparent so a click anywhere on the overlay -- including
+        directly on top of the question or answer text -- still starts a
+        window drag (see mousePressEvent) instead of being swallowed by
+        the label; these are read-only glanceable text, not meant to
+        support text selection, so trading that away for drag-anywhere is
+        the right call here.
+
+        Returns:
+            QLabel: the (initially empty) text label to keep updated.
+        """
+        caption = QLabel(caption_text)
+        caption.setTextFormat(Qt.PlainText)
+        caption.setStyleSheet(f"color: {OVERLAY_CAPTION_COLOR}; font-size: 10px; font-weight: 600;")
+        caption.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        layout.addWidget(caption)
+
+        text_label = QLabel("")
+        # Live transcript text and claude's own output are both arbitrary
+        # content this app doesn't control -- forced to PlainText (rather
+        # than the QLabel default of AutoText, which sniffs content and
+        # renders anything that looks like HTML as markup) so a stray
+        # "<" from spoken text or a pasted URL can never get silently
+        # parsed/dropped instead of shown verbatim. Found by /code-review,
+        # Day 18.
+        text_label.setTextFormat(Qt.PlainText)
+        text_label.setWordWrap(True)
+        text_label.setStyleSheet(f"color: {text_color}; font-size: 13px;")
+        text_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        layout.addWidget(text_label)
+        return text_label
+
+    def update_suggestion(self, question, answer):
+        """Updates the overlay's question and answer text to a newly received suggestion -- see _build_scroll_area() for how text longer than the window's current size stays reachable rather than getting clipped."""
+        self._question_label.setText(question)
+        self._answer_label.setText(answer)
+
+    def set_opacity(self, opacity):
+        """Sets the whole overlay's opacity (0.0-1.0), including its background and text -- see create_overlay_controls()'s slider."""
+        self.setWindowOpacity(opacity)
+
+    def set_click_through(self, enabled):
+        """
+        Toggles click-through mode: while enabled, mouse events (including
+        drag and the resize grip) pass straight through the overlay to
+        whatever's underneath it instead of reaching this window at all,
+        via Qt.WindowTransparentForInput. Mutually exclusive with
+        dragging/resizing by construction -- there's no separate flag to
+        turn those off, since a window that isn't receiving mouse events
+        can't act on them either way. Changing a window's flags hides it
+        on most platforms, so this re-shows it afterward, but only if it
+        was actually visible beforehand -- toggling click-through while
+        the overlay is hidden (via the show/hide hotkey) shouldn't force
+        it to appear.
+        """
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowTransparentForInput, enabled)
+        if was_visible:
+            self.show()
+
+    def mousePressEvent(self, event):
+        """Starts a drag if the left button was pressed, recording the click's offset from the window's current position."""
+        if event.button() == Qt.LeftButton:
+            self._drag_offset = event.globalPosition().toPoint() - self.pos()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        """While a drag is in progress, moves the window so it stays under the cursor at the same offset recorded in mousePressEvent."""
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        """
+        Ends the current drag, if any -- only on releasing the left button,
+        the one that can start a drag (see mousePressEvent). Checked
+        because a release event fires for any button, not just the one
+        that started the drag: without this check, releasing an unrelated
+        button (e.g. a touchpad's right-click) while still holding the
+        left button down mid-drag would end the drag early, even though
+        the left button -- the one mouseMoveEvent actually watches -- was
+        never released. Found by /code-review, Day 18.
+        """
+        if event.button() != Qt.LeftButton:
+            return
+        self._drag_offset = None
+
+    def resizeEvent(self, event):
+        """
+        Whenever the window's own size actually changes (drag-resize via
+        the grip, or the initial show), re-pins the scrollable content's
+        width to the scroll area's current viewport width -- see
+        _build_scroll_area()'s docstring for why this needs to happen
+        explicitly rather than trusting setWidgetResizable(True) alone.
+
+        Deferred one event-loop tick via self._scroll_width_sync_timer
+        (a reused single-shot timer, not read synchronously right here:
+        confirmed empirically (/code-review, Day 18) that reading
+        self._scroll_area.viewport().width() immediately inside
+        resizeEvent() returns a stale value -- Qt hadn't yet finished
+        cascading the window's new size down into the scroll area's own
+        child layout at that point, so every read kept returning an old
+        (or, before the first real show, a not-yet-laid-out default) width
+        instead of the current one. Giving Qt's event loop one more turn
+        before reading it is the standard way around this class of Qt
+        layout-timing gap. Restarting the same timer (rather than firing a
+        fresh QTimer.singleShot(0, ...) each time) also debounces a rapid
+        burst of resizeEvent calls -- e.g. dragging the QSizeGrip -- down
+        to one actual resync instead of one per intermediate frame.
+        """
+        super().resizeEvent(event)
+        self._scroll_width_sync_timer.start()
+
+    def _sync_scroll_content_width(self):
+        """
+        Pins the scrollable content's width to the scroll area's own
+        viewport width -- see resizeEvent()'s docstring for why this runs
+        deferred rather than synchronously during the resize. Reading the
+        viewport's width directly is safe here (rather than reserving
+        space defensively the way an early version of this method had to):
+        the scroll area's own vertical scrollbar is permanently off (see
+        _build_scroll_area()), so nothing ever shrinks the viewport out
+        from under this value the way a just-appearing internal scrollbar
+        once did.
+        """
+        self._scroll_content.setFixedWidth(self._scroll_area.viewport().width())
+
+
 def create_overlay_window():
     """
-    Builds the always-on-top overlay window: frameless, stays above other
-    windows, and shows only the latest suggestion text -- deliberately
-    minimal, per PRD §8 Phase 2 (no transcript, no settings, no session
-    controls here; those all stay on the main window). Starts hidden;
-    create_overlay_toggle() below wires up the hotkey that shows it.
-
-    WA_QuitOnClose is turned off for this window specifically so it
-    doesn't count toward Qt's "quit once every counted window is closed"
-    check -- without this, closing the main window while the overlay
-    happens to still be visible would leave the app running invisibly,
-    since the overlay would still be an open, counted window.
+    Creates the overlay window.
 
     Returns:
-        tuple[QWidget, QPlainTextEdit]: the overlay window itself, and the
-        read-only pane inside it to keep in sync with the latest
-        suggestion (see connect_incoming_messages_to_ui()).
+        OverlayWindow: the overlay, ready to be shown by create_overlay_toggle()'s hotkey.
     """
-    window = QWidget()
-    window.setWindowTitle("Adarna Overlay")
-    window.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-    window.resize(420, 160)
-    window.setAttribute(Qt.WA_QuitOnClose, False)
+    return OverlayWindow()
 
-    layout = QVBoxLayout(window)
-    pane = create_readonly_text_pane(layout)
 
-    return window, pane
+def create_overlay_controls(layout, overlay_window):
+    """
+    Adds an "Overlay" settings group to the main window with an opacity
+    slider and a click-through checkbox -- both apply live, immediately,
+    regardless of whether a session is running, unlike "Session Settings"
+    above (which is only read once when Start Session is pressed), so
+    this lives in its own group rather than inside that one.
+    """
+    group = QGroupBox("Overlay")
+    form = QFormLayout(group)
+
+    opacity_row = QHBoxLayout()
+    opacity_slider = QSlider(Qt.Horizontal)
+    opacity_slider.setRange(OVERLAY_OPACITY_MIN_PERCENT, OVERLAY_OPACITY_MAX_PERCENT)
+    opacity_slider.setValue(OVERLAY_OPACITY_DEFAULT_PERCENT)
+    opacity_value_label = QLabel(f"{OVERLAY_OPACITY_DEFAULT_PERCENT}%")
+
+    def handle_opacity_changed(percent):
+        """Applies a new opacity slider value to the overlay and updates the percentage label next to it."""
+        overlay_window.set_opacity(percent / 100)
+        opacity_value_label.setText(f"{percent}%")
+
+    opacity_slider.valueChanged.connect(handle_opacity_changed)
+    overlay_window.set_opacity(OVERLAY_OPACITY_DEFAULT_PERCENT / 100)
+    opacity_row.addWidget(opacity_slider)
+    opacity_row.addWidget(opacity_value_label)
+    form.addRow("Opacity:", opacity_row)
+
+    click_through_checkbox = QCheckBox("Click-through (mouse passes to the window underneath)")
+    click_through_checkbox.toggled.connect(overlay_window.set_click_through)
+    form.addRow(click_through_checkbox)
+
+    layout.addWidget(group)
 
 
 def create_transcript_display(transcript_pane):
@@ -768,6 +1196,18 @@ def create_suggestions_section(layout):
     layout.addWidget(copy_button)
 
     return pane, latest_suggestion
+
+
+def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window):
+    """
+    Creates the SuggestionDisplay that fans out one incoming suggestion to
+    the main pane, the Copy button's tracker, and the overlay.
+
+    Returns:
+        SuggestionDisplay: connect wsl_connection.suggestion_received to
+        its update() method (see connect_incoming_messages_to_ui()).
+    """
+    return SuggestionDisplay(suggestions_pane, latest_suggestion, overlay_window)
 
 
 def create_suggestion_trigger_controls(layout):
@@ -894,23 +1334,17 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
     )
 
 
-def connect_incoming_messages_to_ui(
-    wsl_connection, transcript_display, suggestions_pane, latest_suggestion, overlay_pane
-):
+def connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display):
     """
-    Wires wsl_app's incoming transcript/suggestion messages to the UI:
-    each transcript message updates the transcript pane via
-    transcript_display (committed text appended permanently, tentative
-    text replaced in place -- see TranscriptDisplay), each suggestion
-    replaces whatever the suggestions pane and the overlay pane currently
-    show (both render the same incoming suggestion text -- no protocol
-    change needed for the overlay), and latest_suggestion is kept in sync
-    so the Copy button always has something current to copy.
+    Wires wsl_app's incoming transcript/suggestion messages to the UI: each
+    transcript message updates the transcript pane via transcript_display
+    (committed text appended permanently, tentative text replaced in place
+    -- see TranscriptDisplay), and each suggestion is fanned out by
+    suggestion_display to the main pane, the Copy button's tracker, and the
+    overlay's question/answer labels (see SuggestionDisplay).
     """
     wsl_connection.transcript_received.connect(transcript_display.update)
-    wsl_connection.suggestion_received.connect(suggestions_pane.setPlainText)
-    wsl_connection.suggestion_received.connect(overlay_pane.setPlainText)
-    wsl_connection.suggestion_received.connect(latest_suggestion.update)
+    wsl_connection.suggestion_received.connect(suggestion_display.update)
 
 
 def start_wsl_connection(status_label):
@@ -1157,10 +1591,18 @@ def main():
     """
     Entry point: creates the app, the main window, and the overlay window,
     starts the background connection to wsl_app, wires up WASAPI loopback
-    audio capture, the settings panel, the auto-suggest toggle and manual
-    trigger button, the session start/stop controls, and the global
-    suggestion-trigger and overlay show/hide hotkeys, and runs the event
-    loop until the main window is closed.
+    audio capture, the settings panel, the overlay opacity/click-through
+    controls, the auto-suggest toggle and manual trigger button, the
+    session start/stop controls, and the global suggestion-trigger and
+    overlay show/hide hotkeys, and runs the event loop until the main
+    window is closed.
+
+    The main window's suggestion pane stays answer-only (Day 18): the
+    overlay is the one place the question/answer excerpt pairing actually
+    matters, since it's what's glanced at live during a call, while the
+    main window is mainly used for session start/stop and settings --
+    adding the question there too didn't seem like a clear improvement,
+    just more text in a pane already working fine as-is.
     """
     app = create_app()
     window = create_window()
@@ -1169,11 +1611,13 @@ def main():
     device_dropdown = create_device_dropdown(layout)
     capture_status_label = create_capture_status_label(layout)
     mode_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
+    overlay_window = create_overlay_window()
+    create_overlay_controls(layout, overlay_window)
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
     transcript_display = create_transcript_display(transcript_pane)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
-    overlay_window, overlay_pane = create_overlay_window()
+    suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
 
     audio = pyaudio.PyAudio()
     devices = list_loopback_devices(audio)
@@ -1181,9 +1625,7 @@ def main():
     populate_device_dropdown(device_dropdown, devices, default_device)
 
     wsl_connection = start_wsl_connection(status_label)
-    connect_incoming_messages_to_ui(
-        wsl_connection, transcript_display, suggestions_pane, latest_suggestion, overlay_pane
-    )
+    connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     capture_manager = create_audio_capture_manager(
         audio, wsl_connection, device_dropdown, default_device, capture_status_label

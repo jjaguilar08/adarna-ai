@@ -795,10 +795,14 @@ class MeetingSession:
     async def _generate_and_send_suggestion(self):
         """
         Asks claude for one suggestion based on the recent transcript
-        context and sends it to windows_app as a "suggestion" message. Runs
-        ask() on a background thread via asyncio.to_thread, since it blocks
-        on the subprocess and must not stall audio_chunk handling while a
-        suggestion is being generated.
+        context and sends it to windows_app as a "suggestion" message,
+        carrying both the answer text and the "question" field (Day 18,
+        Phase 2 visual redesign) -- the same rolling transcript context
+        (prompt_text) that was actually sent to claude, reused as-is rather
+        than tracked separately, so the overlay can show what prompted a
+        suggestion right above it. Runs ask() on a background thread via
+        asyncio.to_thread, since it blocks on the subprocess and must not
+        stall audio_chunk handling while a suggestion is being generated.
 
         Skipped (not queued) if a suggestion is already being generated —
         the pause timer and the hotkey are two independent ways to reach
@@ -823,7 +827,10 @@ class MeetingSession:
                 return
             timestamp = time.strftime("%H:%M:%S")
             print(f"[{timestamp}] Suggestion: {suggestion_text}")
-            await send_message(self.writer, {"type": "suggestion", "text": suggestion_text})
+            await send_message(
+                self.writer,
+                {"type": "suggestion", "text": suggestion_text, "question": prompt_text},
+            )
             await self._count_ask_call_and_recycle_if_due()
 
     async def _ask_with_restart_on_crash(self, prompt_text):
