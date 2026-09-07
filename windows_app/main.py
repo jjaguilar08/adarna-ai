@@ -1,4 +1,5 @@
 import base64
+import bisect
 import json
 import queue
 import socket
@@ -107,6 +108,23 @@ OVERLAY_OPACITY_MIN_PERCENT = 20
 OVERLAY_OPACITY_MAX_PERCENT = 100
 OVERLAY_OPACITY_DEFAULT_PERCENT = 90
 
+# The two independent audio sources this app captures and streams to
+# wsl_app (Day 19): the user's own microphone, alongside the pre-existing
+# WASAPI loopback (system audio -- "everyone else"). Values must match
+# wsl_app's own AUDIO_SOURCES strings exactly, since they're sent as-is on
+# every audio_chunk/transcript message -- the two sides don't share a
+# Python module, so this is kept in sync by hand, the same way the wire
+# protocol's message "type" strings already are.
+AUDIO_SOURCE_MIC = "mic"
+AUDIO_SOURCE_LOOPBACK = "loopback"
+
+# What each source's transcript lines are labeled with in the transcript
+# pane (see TranscriptDisplay) -- matches wsl_app's own SOURCE_LABELS.
+TRANSCRIPT_SOURCE_LABELS = {
+    AUDIO_SOURCE_MIC: "You",
+    AUDIO_SOURCE_LOOPBACK: "Them",
+}
+
 
 def load_port():
     """
@@ -133,7 +151,7 @@ class WslConnection(QObject):
     """
 
     connection_changed = Signal(bool)
-    transcript_received = Signal(str)
+    transcript_received = Signal(str, str, float)  # source, text, started_at
     suggestion_received = Signal(str, str)
     session_start_failed_received = Signal(str, int)
 
@@ -189,8 +207,15 @@ class WslConnection(QObject):
         Pongs are just the ping heartbeat's reply (nothing to do);
         transcripts and suggestions are forwarded to their own signal for
         the UI to display -- each transcript message is one finished,
-        pause-bounded sentence from wsl_app's speech segmenter, appended to
-        the transcript pane as-is (see TranscriptDisplay); a suggestion's
+        pause-bounded sentence from wsl_app's speech segmenter for one
+        audio source (Day 19: "mic" or "loopback", see AUDIO_SOURCE_MIC/
+        AUDIO_SOURCE_LOOPBACK), tagged with which source it came from and
+        when it started being spoken (`started_at`, a wall-clock
+        timestamp), both forwarded to TranscriptDisplay so it can label
+        the line and place it in the right chronological spot relative to
+        the other source's lines -- defensively defaulted (source to
+        loopback, started_at to 0.0) the same way "question" below is, in
+        case a field is ever missing or explicitly null; a suggestion's
         "question" field (Day 18) carries the transcript excerpt that
         prompted it, forwarded as suggestion_received's first argument
         (empty string if absent OR explicitly null) so the overlay can
@@ -211,7 +236,9 @@ class WslConnection(QObject):
                 raise OSError("wsl_app closed the connection")
             message = json.loads(line)
             if message.get("type") == "transcript":
-                self.transcript_received.emit(message["text"])
+                self.transcript_received.emit(
+                    message.get("source") or AUDIO_SOURCE_LOOPBACK, message["text"], message.get("started_at") or 0.0
+                )
             elif message.get("type") == "suggestion":
                 self.suggestion_received.emit(message.get("question") or "", message["text"])
             elif message.get("type") == "session_start_failed":
@@ -243,11 +270,17 @@ class WslConnection(QObject):
 
 class AudioCaptureManager(QObject):
     """
-    Owns the background thread that captures WASAPI loopback audio and
-    streams it to wsl_app as audio_chunk messages. Capture only runs
-    during an explicit session (see start_capture()/stop_capture()), and
-    restarts on a new device whenever the dropdown selection changes while
-    a session is running.
+    Owns the background thread that captures audio from one device and
+    streams it to wsl_app as audio_chunk messages, tagged with `source`
+    (Day 19: AUDIO_SOURCE_MIC or AUDIO_SOURCE_LOOPBACK) so wsl_app can feed
+    it into that source's own independent segmenter. One instance covers
+    exactly one source -- main() creates two (see create_audio_capture_manager()),
+    a mic one and a loopback one, run entirely independently: each owns its
+    own capture thread, device selection, and status label, and neither
+    blocks or waits on the other. Capture only runs during an explicit
+    session (see start_capture()/stop_capture()), and restarts on a new
+    device whenever the dropdown selection changes while a session is
+    running.
 
     Stopping never blocks the calling thread: it just signals the capture
     thread and returns. The capture thread does its own (possibly slow)
@@ -269,11 +302,12 @@ class AudioCaptureManager(QObject):
     capture_thread_finished = Signal(bool)
     capture_failed = Signal()
 
-    def __init__(self, audio, wsl_connection):
-        """Stores the shared PyAudio instance and the connection to send chunks over."""
+    def __init__(self, audio, wsl_connection, source):
+        """Stores the shared PyAudio instance, the connection to send chunks over, and which audio source (`source`) this manager captures and tags every chunk with."""
         super().__init__()
         self._audio = audio
         self._wsl_connection = wsl_connection
+        self._source = source
         self._device = None
         self._stop_event = None
         self._thread = None
@@ -452,6 +486,7 @@ class AudioCaptureManager(QObject):
                 self._wsl_connection.send_message(
                     {
                         "type": "audio_chunk",
+                        "source": self._source,
                         "data": base64.b64encode(data).decode("ascii"),
                         "sample_rate": rate,
                         "channels": channels,
@@ -527,13 +562,17 @@ def create_connection_status_label(layout):
     return label
 
 
-def create_device_dropdown(layout):
+def create_device_dropdown(layout, caption):
     """
-    Adds a dropdown for picking which WASAPI loopback device to capture from.
+    Adds a labeled dropdown for picking which audio device to capture from
+    -- `caption` distinguishes which of the two sources (Day 19: loopback
+    or mic) this particular dropdown picks a device for, since main() now
+    adds two of these stacked in the same window.
 
     Returns:
         QComboBox: the (still empty) dropdown to populate with devices.
     """
+    layout.addWidget(QLabel(caption))
     dropdown = QComboBox()
     layout.addWidget(dropdown)
     return dropdown
@@ -541,7 +580,9 @@ def create_device_dropdown(layout):
 
 def create_capture_status_label(layout):
     """
-    Adds a label showing which device is currently being captured.
+    Adds a label showing which device is currently being captured. main()
+    adds one of these per audio source (Day 19), so each source's capture
+    state is visible independently.
 
     Returns:
         QLabel: the label to keep updated as capture starts/stops.
@@ -603,26 +644,39 @@ def create_transcript_pane(layout):
 class TranscriptDisplay(QObject):
     """
     Keeps the transcript pane showing every finished sentence transcribed
-    so far, one appended after another as each pause-bounded segment comes
-    in from wsl_app's speech segmenter (see wsl_app/main.py's
+    so far, one labeled line per pause-bounded segment (see wsl_app/main.py's
     VoiceSegmenter -- Day 18, reverted back to this pause-then-transcribe-
     the-whole-utterance approach from Day 17's real-time streaming
-    rewrite). A QObject (not a plain class) so wsl_connection.
-    transcript_received -- emitted from WslConnection's background reader
-    thread -- can be connected to update() as a real cross-thread queued
-    connection, per this project's own hard-won lesson about lambdas
-    having no owning QObject for Qt to marshal through (see OverlayToggle).
+    rewrite), from either audio source (Day 19: mic or loopback, see
+    AUDIO_SOURCE_MIC/AUDIO_SOURCE_LOOPBACK).
+
+    Each source is captured and transcribed by its own fully independent
+    pipeline (see AudioCaptureManager, wsl_app's VoiceSegmenter-per-source),
+    so segments don't arrive in strict spoken order: a longer mic segment
+    started before a short loopback one can still finish transcribing
+    after it. update() is inserted by `started_at` (bisect.insort) rather
+    than just appended, so the rendered pane still reads in a sane
+    chronological order even when both sides are talking around the same
+    time -- not just correct within each source on its own.
+
+    A QObject (not a plain class) so wsl_connection.transcript_received --
+    emitted from WslConnection's background reader thread -- can be
+    connected to update() as a real cross-thread queued connection, per
+    this project's own hard-won lesson about lambdas having no owning
+    QObject for Qt to marshal through (see OverlayToggle).
     """
 
     def __init__(self, pane):
         """Stores the pane to keep in sync, starting with nothing transcribed yet."""
         super().__init__()
         self._pane = pane
+        # Each entry is (started_at, source, text), kept sorted by
+        # started_at so _render() can just walk it in order.
         self._segments = []
 
-    def update(self, text):
-        """Appends one newly-transcribed sentence to the pane, permanently."""
-        self._segments.append(text)
+    def update(self, source, text, started_at):
+        """Inserts one newly-transcribed, source-tagged sentence into the transcript in chronological order (see class docstring), permanently."""
+        bisect.insort(self._segments, (started_at, source, text))
         self._render()
 
     def reset(self):
@@ -635,8 +689,9 @@ class TranscriptDisplay(QObject):
         self._render()
 
     def _render(self):
-        """Rewrites the pane's full text from the segment list, and scrolls to the end so newly-appended text stays visible."""
-        self._pane.setPlainText(" ".join(self._segments))
+        """Rewrites the pane's full text from the segment list, one labeled line per segment, and scrolls to the end so newly-appended text stays visible."""
+        lines = [f"{TRANSCRIPT_SOURCE_LABELS[source]}: {text}" for _started_at, source, text in self._segments]
+        self._pane.setPlainText("\n".join(lines))
         cursor = self._pane.textCursor()
         cursor.movePosition(cursor.MoveOperation.End)
         self._pane.setTextCursor(cursor)
@@ -1288,12 +1343,39 @@ def current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, 
 
 def list_loopback_devices(audio):
     """
-    Lists every WASAPI loopback-capable device available for capture.
+    Lists every WASAPI loopback-capable device available for capture --
+    each one captures system audio (everyone else's side of a call), not a
+    real microphone. See list_mic_devices() for the other source Day 19
+    added.
 
     Returns:
         list[dict]: pyaudiowpatch device info dicts, one per loopback device.
     """
     return list(audio.get_loopback_device_info_generator())
+
+
+def list_mic_devices(audio):
+    """
+    Lists every real microphone/input device available for capture (Day
+    19) -- every input-capable device except WASAPI loopback devices.
+    Loopback devices also report maxInputChannels > 0 (that's how
+    pyaudiowpatch exposes "capture what's currently playing" at all), but
+    each one represents a system output being captured as input, not
+    someone's actual microphone, so they're excluded here and listed
+    separately by list_loopback_devices() instead -- verified against the
+    installed pyaudiowpatch that every device dict carries its own
+    isLoopbackDevice flag, which is exactly the distinction needed.
+
+    Returns:
+        list[dict]: pyaudiowpatch device info dicts, one per real
+        microphone/input device.
+    """
+    devices = []
+    for index in range(audio.get_device_count()):
+        device = audio.get_device_info_by_index(index)
+        if device["maxInputChannels"] > 0 and not device.get("isLoopbackDevice", False):
+            devices.append(device)
+    return devices
 
 
 def populate_device_dropdown(dropdown, devices, default_device):
@@ -1304,6 +1386,31 @@ def populate_device_dropdown(dropdown, devices, default_device):
         (i for i, device in enumerate(devices) if device["index"] == default_device["index"]), 0
     )
     dropdown.setCurrentIndex(default_index)
+
+
+def get_default_mic_device(audio, mic_devices):
+    """
+    Finds the system's default microphone, if it has one it can actually
+    use (Day 19). Unlike loopback -- every machine that can run this app
+    has a default output device to loop back -- a working default input
+    device isn't something to assume: pyaudiowpatch's
+    get_default_input_device_info() raises OSError on a machine with no
+    microphone plugged in, or whose default recording device is disabled
+    in Windows -- a real, unexceptional case this app shouldn't crash on
+    startup over, since mic capture just isn't available there. Falls back
+    to the first device list_mic_devices() found, if any, so a machine
+    with a real mic that simply isn't set as "default" still gets one
+    preselected rather than being treated the same as having none at all.
+
+    Returns:
+        dict | None: the mic device to preselect, or None if this machine
+        has no usable microphone at all -- main() disables mic capture
+        entirely in that case rather than failing to start.
+    """
+    try:
+        return audio.get_default_input_device_info()
+    except OSError:
+        return mic_devices[0] if mic_devices else None
 
 
 def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
@@ -1431,18 +1538,20 @@ def start_global_hotkeys(hotkey_actions):
     return hotkey_listener
 
 
-def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default_device, capture_status_label):
+def create_audio_capture_manager(audio, wsl_connection, source, device_dropdown, default_device, capture_status_label):
     """
-    Creates the audio capture manager: preselects the default device,
-    restarts capture on a new device whenever the dropdown changes (if a
-    session is running), and keeps capture_status_label in sync. Capture
-    itself only starts/stops via start_session()/stop_session() — see
-    create_session_controls().
+    Creates the audio capture manager for one audio source (`source` --
+    Day 19: AUDIO_SOURCE_MIC or AUDIO_SOURCE_LOOPBACK): preselects the
+    default device, restarts capture on a new device whenever the dropdown
+    changes (if a session is running), and keeps capture_status_label in
+    sync. Capture itself only starts/stops via start_session()/
+    stop_session() — see create_session_controls(), which now starts/stops
+    both this and the other source's manager together.
 
     Returns:
         AudioCaptureManager: the manager driving the capture thread.
     """
-    capture_manager = AudioCaptureManager(audio, wsl_connection)
+    capture_manager = AudioCaptureManager(audio, wsl_connection, source)
     capture_manager.status_changed.connect(capture_status_label.setText)
     capture_manager.set_device(default_device)
     device_dropdown.currentIndexChanged.connect(
@@ -1453,7 +1562,7 @@ def create_audio_capture_manager(audio, wsl_connection, device_dropdown, default
 
 def create_session_controls(
     wsl_connection,
-    capture_manager,
+    capture_managers,
     mode_dropdown,
     pause_dropdown,
     context_notes_edit,
@@ -1470,17 +1579,22 @@ def create_session_controls(
     settings panel's current values (including the context notes and the
     auto-suggest checkbox's starting state) as settings_changed, then
     session_started (tagged with a fresh attempt_id — see
-    handle_session_start_failed), and starts audio capture; stopping
-    sends session_stopped and stops it. Button enabled-state tracks which
-    action is currently valid.
+    handle_session_start_failed), and starts capture on every manager in
+    `capture_managers` (Day 19: one for mic, one for loopback — each is
+    already its own independent capture thread, so starting/stopping both
+    here just means neither has to wait on the other); stopping sends
+    session_stopped and stops every manager. Button enabled-state tracks
+    which action is currently valid.
 
     Also handles three ways a session can end itself, all reverting to the
     same clean pre-session UI state stop_session() reaches (see
     end_session()): wsl_app reporting it couldn't start the session at all
     (session_start_failed — e.g. the claude CLI process failing to start),
-    the wsl_app connection dropping mid-session, and the local audio
-    capture stream itself failing mid-session (e.g. the Windows audio
-    device disappeared or changed).
+    the wsl_app connection dropping mid-session, and either source's local
+    audio capture stream failing mid-session (e.g. its Windows audio
+    device disappeared or changed) — either one ends the whole session,
+    since a suggestion built from only one side of the conversation for
+    the rest of it isn't something to silently fall back to.
     """
     start_button, stop_button = create_session_buttons(layout)
     current_attempt_id = 0
@@ -1490,26 +1604,28 @@ def create_session_controls(
         start_button.setEnabled(True)
         stop_button.setEnabled(False)
 
-    def end_session(notify_wsl_app, capture_already_stopped):
+    def end_session(notify_wsl_app):
         """
         Shared teardown for every way a session can end — an explicit Stop
         Session click, wsl_app failing to start one, the wsl_app connection
-        dropping, or the capture stream failing — so each caller only has
-        to say which parts of that teardown it still needs to do:
-        notify_wsl_app is False when wsl_app already knows the session
-        isn't running (it never started one, or the connection to it is
-        already dead); capture_already_stopped is True when the capture
-        thread has already finished on its own (a stream failure) rather
-        than needing to be told to stop.
+        dropping, or either source's capture stream failing — so each
+        caller only has to say whether wsl_app still needs to be told
+        (notify_wsl_app is False when it already knows the session isn't
+        running: it never started one, or the connection to it is already
+        dead). stop_capture() is called unconditionally on every manager,
+        including whichever one (if any) already stopped itself after a
+        stream failure — AudioCaptureManager.stop_capture() is a safe
+        no-op on a manager that isn't currently capturing, so there's no
+        need to track which manager, if any, already stopped.
         """
         if notify_wsl_app:
             wsl_connection.send_message({"type": "session_stopped"})
-        if not capture_already_stopped:
+        for capture_manager in capture_managers:
             capture_manager.stop_capture()
         revert_to_pre_session_state()
 
     def start_session():
-        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture, and flips button state."""
+        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture on every source, and flips button state."""
         nonlocal current_attempt_id
         current_attempt_id += 1
         transcript_display.reset()
@@ -1517,13 +1633,14 @@ def create_session_controls(
             current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox)
         )
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
-        capture_manager.start_capture()
+        for capture_manager in capture_managers:
+            capture_manager.start_capture()
         start_button.setEnabled(False)
         stop_button.setEnabled(True)
 
     def stop_session():
         """Ends a session the user explicitly asked to stop."""
-        end_session(notify_wsl_app=True, capture_already_stopped=False)
+        end_session(notify_wsl_app=True)
 
     def handle_session_start_failed(reason, attempt_id):
         """
@@ -1538,7 +1655,7 @@ def create_session_controls(
         """
         if attempt_id != current_attempt_id:
             return
-        end_session(notify_wsl_app=False, capture_already_stopped=False)
+        end_session(notify_wsl_app=False)
         QMessageBox.warning(window, "Session Failed to Start", reason)
 
     def handle_connection_changed(connected):
@@ -1552,36 +1669,43 @@ def create_session_controls(
         """
         if connected or not stop_button.isEnabled():
             return
-        end_session(notify_wsl_app=False, capture_already_stopped=False)
+        end_session(notify_wsl_app=False)
 
     def handle_capture_failed():
         """
-        The local audio capture stream itself failed mid-session (e.g. the
-        Windows audio device disappeared or changed) — ends the session the
-        same way Stop Session would, since wsl_app would otherwise be left
-        waiting for audio that's never coming. Capture has already stopped
-        by the time this fires.
+        One source's local audio capture stream itself failed mid-session
+        (e.g. its Windows audio device disappeared or changed) — ends the
+        whole session the same way Stop Session would, since wsl_app would
+        otherwise be left waiting for audio that's never coming from that
+        source. That source's capture has already stopped by the time this
+        fires; end_session() also stops the other, still-healthy source's
+        capture as part of the same teardown.
         """
         if not stop_button.isEnabled():
             return
-        end_session(notify_wsl_app=True, capture_already_stopped=True)
+        end_session(notify_wsl_app=True)
 
     start_button.clicked.connect(start_session)
     stop_button.clicked.connect(stop_session)
     wsl_connection.session_start_failed_received.connect(handle_session_start_failed)
     wsl_connection.connection_changed.connect(handle_connection_changed)
-    capture_manager.capture_failed.connect(handle_capture_failed)
+    for capture_manager in capture_managers:
+        capture_manager.capture_failed.connect(handle_capture_failed)
 
 
 def main():
     """
     Entry point: creates the app, the main window, and the overlay window,
-    starts the background connection to wsl_app, wires up WASAPI loopback
-    audio capture, the settings panel, the overlay opacity/click-through
-    controls, the auto-suggest toggle and manual trigger button, the
-    session start/stop controls, and the global suggestion-trigger and
-    overlay show/hide hotkeys, and runs the event loop until the main
-    window is closed.
+    starts the background connection to wsl_app, wires up both audio
+    sources' capture (Day 19: WASAPI loopback for system audio, plus the
+    user's own microphone -- each with its own device picker and capture
+    status label, each its own independent AudioCaptureManager; mic
+    capture is skipped entirely, loopback-only, on a machine with no
+    usable microphone -- see get_default_mic_device()), the
+    settings panel, the overlay opacity/click-through controls, the
+    auto-suggest toggle and manual trigger button, the session start/stop
+    controls, and the global suggestion-trigger and overlay show/hide
+    hotkeys, and runs the event loop until the main window is closed.
 
     The main window's suggestion pane stays answer-only (Day 18): the
     overlay is the one place the question/answer excerpt pairing actually
@@ -1594,8 +1718,10 @@ def main():
     window = create_window()
     layout = create_central_widget(window)
     status_label = create_connection_status_label(layout)
-    device_dropdown = create_device_dropdown(layout)
-    capture_status_label = create_capture_status_label(layout)
+    loopback_device_dropdown = create_device_dropdown(layout, "Loopback device (system audio, i.e. \"Them\"):")
+    loopback_capture_status_label = create_capture_status_label(layout)
+    mic_device_dropdown = create_device_dropdown(layout, "Microphone device (your own voice, i.e. \"You\"):")
+    mic_capture_status_label = create_capture_status_label(layout)
     mode_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
     overlay_window = create_overlay_window()
     create_overlay_controls(layout, overlay_window)
@@ -1606,19 +1732,37 @@ def main():
     suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
 
     audio = pyaudio.PyAudio()
-    devices = list_loopback_devices(audio)
-    default_device = audio.get_default_wasapi_loopback()
-    populate_device_dropdown(device_dropdown, devices, default_device)
+    loopback_devices = list_loopback_devices(audio)
+    default_loopback_device = audio.get_default_wasapi_loopback()
+    populate_device_dropdown(loopback_device_dropdown, loopback_devices, default_loopback_device)
+    mic_devices = list_mic_devices(audio)
+    default_mic_device = get_default_mic_device(audio, mic_devices)
+    if default_mic_device is not None:
+        populate_device_dropdown(mic_device_dropdown, mic_devices, default_mic_device)
+    else:
+        # No usable microphone on this machine (see get_default_mic_device)
+        # -- run loopback-only rather than fail to start. Left visibly
+        # disabled instead of hidden, so it's clear mic capture exists but
+        # isn't available, not silently missing.
+        mic_device_dropdown.setEnabled(False)
+        mic_capture_status_label.setText("No microphone available")
 
     wsl_connection = start_wsl_connection(status_label)
     connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
-    capture_manager = create_audio_capture_manager(
-        audio, wsl_connection, device_dropdown, default_device, capture_status_label
+    loopback_capture_manager = create_audio_capture_manager(
+        audio, wsl_connection, AUDIO_SOURCE_LOOPBACK, loopback_device_dropdown, default_loopback_device,
+        loopback_capture_status_label,
     )
+    capture_managers = [loopback_capture_manager]
+    if default_mic_device is not None:
+        mic_capture_manager = create_audio_capture_manager(
+            audio, wsl_connection, AUDIO_SOURCE_MIC, mic_device_dropdown, default_mic_device, mic_capture_status_label
+        )
+        capture_managers.append(mic_capture_manager)
     create_session_controls(
         wsl_connection,
-        capture_manager,
+        capture_managers,
         mode_dropdown,
         pause_dropdown,
         context_notes_edit,

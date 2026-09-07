@@ -6,12 +6,15 @@ import asyncio
 # not a silent trap if the interpreter version ever changes.
 import audioop
 import base64
+import bisect
 import json
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy
 import webrtcvad
@@ -40,8 +43,28 @@ BYTES_PER_FRAME = int(TARGET_SAMPLE_RATE * FRAME_DURATION_SECONDS) * 2  # 16-bit
 
 # webrtcvad's own "how strict should speech-detection be" setting, on its
 # own 0-3 scale: 0 accepts more borderline sound as speech, 3 rejects more
-# of it.
+# of it. Used for loopback (see VoiceSegmenter's speech_detection_strictness
+# param, and MeetingSession, which picks the right constant per source).
 SPEECH_DETECTION_STRICTNESS = 2
+
+# The mic's own, stricter strictness (Day 19). A real microphone has a
+# genuine, continuous noise floor -- room tone, breathing, a fan, mic
+# self-noise -- that loopback's clean digital output audio simply doesn't
+# have; at loopback's strictness (2), live testing found this reliably
+# opened short false-positive "speech" segments on quiet mic noise, and
+# faster-whisper then hallucinated fabricated, out-of-context text for
+# them (e.g. "It's a wig.", "if you're not safe.") rather than
+# transcribing real content -- a classic Whisper failure mode (see
+# streaming_transcriber.py's NO_SPEECH_PROBABILITY_THRESHOLD/AVG_LOGPROB_
+# THRESHOLD docstrings for the general pattern), triggered here by VAD
+# false positives feeding it noise to begin with rather than by anything
+# those two filters are tuned to catch. 3 is webrtcvad's strictest/least
+# permissive setting -- the most direct lever to cut down on noise-driven
+# false positives at the source, before they ever reach Whisper. Needs
+# real re-verification against an actual mic (see project conventions on
+# live-verifying accuracy changes) -- this is a principled first attempt
+# based on the real failure observed, not a tuned/confirmed value yet.
+MIC_SPEECH_DETECTION_STRICTNESS = 3
 
 # How long a pause has to last before a sentence is considered "done" and
 # the segment closes.
@@ -92,17 +115,51 @@ TRANSCRIBE_BEAM_SIZE = 5
 DEFAULT_WHISPER_MODEL_SIZE = "small.en"
 DEFAULT_MODE = "meeting"
 
+# The two independent audio sources a session can capture from (Day 19):
+# the user's own microphone, and the existing WASAPI loopback (system
+# audio, i.e. "everyone else"). Each gets its own VoiceSegmenter (see
+# MeetingSession) so one source's speech and pauses never affect the
+# other's segmentation. SOURCE_LABELS is what each source's lines are
+# tagged with everywhere transcribed text shows up -- the live transcript
+# and the rolling context sent to Claude -- so a suggestion prompt (and,
+# later, a summary) can tell who said what.
+AUDIO_SOURCES = ("mic", "loopback")
+SOURCE_LABELS = {"mic": "You", "loopback": "Them"}
+
+# Which VAD strictness (see SPEECH_DETECTION_STRICTNESS/MIC_SPEECH_
+# DETECTION_STRICTNESS above) each source's VoiceSegmenter should use --
+# read by MeetingSession when it builds one segmenter per source.
+SPEECH_DETECTION_STRICTNESS_BY_SOURCE = {
+    "mic": MIC_SPEECH_DETECTION_STRICTNESS,
+    "loopback": SPEECH_DETECTION_STRICTNESS,
+}
+
 # How long a pause has to last, with no further new transcript segment
 # arriving during it, before a suggestion is generated automatically —
 # used as the default until a session-specific value arrives via
 # settings_changed.
 PAUSE_SECONDS_BEFORE_SUGGESTION = 1.2
 
-# How many recent transcript segments are kept and sent as context with
-# each suggestion request, and how many ask() calls a session's claude CLI
-# process handles before being recycled (stopped and restarted fresh) to
-# bound its own automatically-growing internal conversation history.
-SEGMENTS_TO_KEEP_FOR_CONTEXT = 10
+# How much recent transcript text is kept and sent as context with each
+# suggestion request. Originally (Day 7) a fixed count of 10 segments,
+# sized around a single audio source -- Day 18.7's context-feed spike
+# flagged that a fixed segment count is the wrong shape once a second
+# source (Day 19's own mic capture, above) can add its own segments
+# concurrently: two active sources fill a fixed count roughly twice as
+# fast in real time, so real context would fall out of the window sooner
+# than it used to, for no principled reason. A character budget scales
+# naturally with however many sources are actually producing text instead.
+# Day 18.7 also confirmed a wider context window is nearly free -- marginal
+# prompt tokens only, no extra claude CLI calls -- so there's no real cost
+# to sizing this generously. 4000 characters is roughly double the old
+# 10-segment cap's typical size (segments commonly run 200-400 characters
+# each), meant to give a two-source session about the same real
+# conversational time-depth the old cap gave a one-source session.
+CONTEXT_CHARACTER_BUDGET = 4000
+
+# How many ask() calls a session's claude CLI process handles before being
+# recycled (stopped and restarted fresh) to bound its own
+# automatically-growing internal conversation history.
 ASK_CALLS_BEFORE_RECYCLING_CLAUDE_CLI = 10
 
 
@@ -203,12 +260,36 @@ def load_whisper_model(model_size):
 class WhisperModelManager:
     """
     Owns the one Whisper model shared by whichever session is active --
-    always small.en, see DEFAULT_WHISPER_MODEL_SIZE.
+    always small.en, see DEFAULT_WHISPER_MODEL_SIZE -- and the lock that
+    serializes every real transcribe() call against it (see
+    transcribe_lock).
     """
 
     def __init__(self):
-        """Loads the model right away, so it's ready before the first session."""
+        """Loads the model right away, so it's ready before the first session, and creates the lock every transcribe call must hold."""
         self.model = load_whisper_model(DEFAULT_WHISPER_MODEL_SIZE)
+        # Real transcribe() calls are CPU-bound and all share this one
+        # loaded model. Day 19 live testing (mic capture, a second
+        # concurrent source) found that letting two segments' transcribe
+        # calls actually run at the same time causes severe CPU
+        # contention, not real parallelism: individual segment transcribe
+        # times observed up to 30+ seconds, for audio that normally
+        # transcribes in 2-4s (Day 18.5's own benchmark) -- matching Day
+        # 18.6's earlier, independent finding that concurrent Whisper
+        # decode calls compete for the same cores and slow each other down
+        # rather than genuinely parallelizing. Worse under mic capture
+        # specifically, since a real mic's noise floor can trigger many
+        # short false-positive segments in a burst (see VoiceSegmenter's
+        # per-source speech_detection_strictness), each spawning its own
+        # asyncio.create_task with no concurrency limit -- without this
+        # lock, a burst like that pile up and fight for CPU all at once.
+        # This lock serializes only the actual decode step across every
+        # session and source; segmentation, capture, and everything else
+        # about each source stays fully independent (see VoiceSegmenter/
+        # AudioCaptureManager) -- a burst of segments still queues and
+        # drains through transcription in order, just one at a time,
+        # rather than all competing for the same CPU simultaneously.
+        self.transcribe_lock = asyncio.Lock()
 
 
 async def send_message(writer, message):
@@ -235,11 +316,15 @@ class AudioLevelTracker:
     """
     Counts how many audio chunks arrive and how loud the loudest one is,
     over roughly one second at a time, so we can log a single summary line
-    per second instead of spamming a line per chunk.
+    per second instead of spamming a line per chunk. One instance per audio
+    source (see handle_client's audio_trackers) -- mic and loopback have
+    very different typical gain/volume profiles, so a shared tracker would
+    make the logged stats actively misleading rather than just imprecise.
     """
 
-    def __init__(self):
-        """Starts a fresh one-second tracking window."""
+    def __init__(self, label):
+        """Starts a fresh one-second tracking window for one audio source, identified as `label` in its printed summaries."""
+        self._label = label
         self._window_start = time.monotonic()
         self._chunk_count = 0
         self._peak_amplitude = 0.0
@@ -257,12 +342,33 @@ class AudioLevelTracker:
         elapsed = time.monotonic() - self._window_start
         if elapsed >= STATS_WINDOW_SECONDS:
             print(
-                f"Audio: {self._chunk_count} chunks in {elapsed:.1f}s, "
+                f"Audio ({self._label}): {self._chunk_count} chunks in {elapsed:.1f}s, "
                 f"peak amplitude {self._peak_amplitude:.4f}"
             )
             self._window_start = time.monotonic()
             self._chunk_count = 0
             self._peak_amplitude = 0.0
+
+
+class ClosedSegment(NamedTuple):
+    """
+    One finished speech segment, as handed back by VoiceSegmenter: its
+    recorded audio, and the wall-clock time (time.time(), not
+    time.monotonic() -- this is sent to windows_app and compared against
+    the other source's segments, so it needs to mean the same instant on
+    both sides, which only an actual wall-clock timestamp does) its first
+    speech frame arrived. started_at is what lets a transcript with two
+    independent sources (mic + loopback) still land in the right
+    chronological order relative to each other once both are transcribed
+    (see MeetingSession.add_transcript_segment and windows_app's
+    TranscriptDisplay) -- transcription finishing order isn't reliable for
+    this, since two segments of different length or two pipelines under
+    different CPU load can finish in a different order than they were
+    actually spoken in.
+    """
+
+    audio_bytes: bytes
+    started_at: float
 
 
 class VoiceSegmenter:
@@ -281,16 +387,21 @@ class VoiceSegmenter:
       5. If speech runs on for MAX_SEGMENT_SECONDS without ever pausing
          that long, the segment is force-closed anyway, so one very long
          run-on sentence can't grow the recording forever.
+
+    One instance covers exactly one audio source (see MeetingSession, which
+    keeps a separate VoiceSegmenter per source) -- speech and pauses on one
+    source never affect how the other source's segments open or close.
     """
 
-    def __init__(self):
-        """Starts with nothing recorded yet and no segment in progress."""
-        self._speech_detector = webrtcvad.Vad(SPEECH_DETECTION_STRICTNESS)
+    def __init__(self, speech_detection_strictness=SPEECH_DETECTION_STRICTNESS):
+        """Starts with nothing recorded yet and no segment in progress, using `speech_detection_strictness` (see SPEECH_DETECTION_STRICTNESS/MIC_SPEECH_DETECTION_STRICTNESS) to judge what counts as speech."""
+        self._speech_detector = webrtcvad.Vad(speech_detection_strictness)
         # Audio that has arrived but hasn't been sliced into a full frame yet.
         self._unsliced_audio = bytearray()
         # Audio recorded for the segment currently in progress, if any.
         self._current_segment_audio = bytearray()
         self._segment_is_open = False
+        self._segment_started_at = None
         self._seconds_of_silence_in_a_row = 0.0
         self._seconds_recorded_in_current_segment = 0.0
 
@@ -305,9 +416,9 @@ class VoiceSegmenter:
         up, and checks each slice in turn.
 
         Returns:
-            list[bytes]: zero or more segments that finished (closed)
-            while processing this batch of audio, each ready to hand to
-            Whisper. Usually empty — most calls just add to an
+            list[ClosedSegment]: zero or more segments that finished
+            (closed) while processing this batch of audio, each ready to
+            hand to Whisper. Usually empty — most calls just add to an
             open segment without finishing it.
         """
         self._unsliced_audio.extend(audio_bytes)
@@ -329,9 +440,9 @@ class VoiceSegmenter:
         any). Called once per slice, in order, by add_audio().
 
         Returns:
-            bytes | None: the finished segment, if this slice was the one
-            that closed it. None if the segment is still open, or if
-            there's no segment in progress and this slice was silence.
+            ClosedSegment | None: the finished segment, if this slice was
+            the one that closed it. None if the segment is still open, or
+            if there's no segment in progress and this slice was silence.
         """
         this_frame_is_speech = self._speech_detector.is_speech(frame, TARGET_SAMPLE_RATE)
 
@@ -343,6 +454,11 @@ class VoiceSegmenter:
         self._seconds_recorded_in_current_segment += FRAME_DURATION_SECONDS
 
         if this_frame_is_speech:
+            if not self._segment_is_open:
+                # The first speech frame of a brand new segment -- record
+                # when it actually started, not when it happens to close
+                # (see ClosedSegment's docstring for why this matters).
+                self._segment_started_at = time.time()
             self._segment_is_open = True
             self._seconds_of_silence_in_a_row = 0.0
         else:
@@ -362,14 +478,16 @@ class VoiceSegmenter:
         heard starts a brand new segment.
 
         Returns:
-            bytes: the finished segment's audio.
+            ClosedSegment: the finished segment's audio and start time.
         """
         finished_segment_audio = bytes(self._current_segment_audio)
+        started_at = self._segment_started_at
         self._current_segment_audio = bytearray()
         self._segment_is_open = False
+        self._segment_started_at = None
         self._seconds_of_silence_in_a_row = 0.0
         self._seconds_recorded_in_current_segment = 0.0
-        return finished_segment_audio
+        return ClosedSegment(finished_segment_audio, started_at)
 
     def close_open_segment(self):
         """
@@ -379,7 +497,7 @@ class VoiceSegmenter:
         isn't silently dropped.
 
         Returns:
-            bytes | None: the finished segment's audio, or None if nothing
+            ClosedSegment | None: the finished segment, or None if nothing
             was open.
         """
         if not self._segment_is_open:
@@ -414,72 +532,100 @@ def transcribe_segment(model, audio_bytes):
     return "".join(word[2] for word in words).strip()
 
 
-async def transcribe_segment_and_report(model, writer, audio_bytes, session=None):
+async def transcribe_segment_and_report(model, transcribe_lock, writer, audio_bytes, source, started_at, session=None):
     """
     Transcribes one closed speech segment in a background thread (keeping
     the event loop free to keep reading incoming messages), logs the
     result with a timestamp, and — if it contains real text — sends it to
-    windows_app as a transcript message. If this segment belongs to a
+    windows_app as a transcript message tagged with which audio source
+    (`source`, e.g. "mic"/"loopback") it came from and when it started
+    (`started_at`), so windows_app can label it and place it in the right
+    chronological spot relative to the other source's lines (see
+    windows_app's TranscriptDisplay). If this segment belongs to a
     still-active session, also feeds the text into that session's rolling
     context and suggestion trigger (see MeetingSession). `session` is left
     as None for a segment transcribed after its session has already ended
     (the trailing bit of audio flushed on session_stopped), so it's
     reported but doesn't try to trigger a suggestion from a session that no
-    longer exists.
+    longer exists. `transcribe_lock` (see WhisperModelManager) is held only
+    around the actual transcribe call, so segments still queue up and wait
+    their turn instead of fighting each other for CPU -- the logged
+    "Xs to transcribe" duration includes any time spent waiting for the
+    lock, which is real, user-facing latency either way.
     """
     duration_seconds = segment_duration_seconds(audio_bytes)
-    started_at = time.monotonic()
-    text = await asyncio.to_thread(transcribe_segment, model, audio_bytes)
-    elapsed_seconds = time.monotonic() - started_at
+    transcribe_started_at = time.monotonic()
+    async with transcribe_lock:
+        text = await asyncio.to_thread(transcribe_segment, model, audio_bytes)
+    elapsed_seconds = time.monotonic() - transcribe_started_at
     timestamp = time.strftime("%H:%M:%S")
     spoken_text = text if text else "(no speech detected)"
     print(
-        f"[{timestamp}] Transcript ({duration_seconds:.1f}s segment, "
+        f"[{timestamp}] Transcript ({source}, {duration_seconds:.1f}s segment, "
         f"{elapsed_seconds:.1f}s to transcribe): {spoken_text}"
     )
     if text:
-        await send_message(writer, {"type": "transcript", "text": text})
+        await send_message(writer, {"type": "transcript", "text": text, "source": source, "started_at": started_at})
         if session is not None:
-            session.add_transcript_segment(text)
+            session.add_transcript_segment(source, text, started_at)
 
 
-def handle_finished_segment(model, writer, audio_bytes, session=None):
+def handle_finished_segment(model, transcribe_lock, writer, closed_segment, source, session=None):
     """
     Decides what to do with one just-closed speech segment: skip
     transcription entirely if it's too short to plausibly be real speech
     (a false positive from the speech detector that would otherwise cost a
     full, slow model call for nothing), or kick off background
-    transcription-and-reporting otherwise. `session` is passed through to
-    transcribe_segment_and_report() -- see its docstring.
+    transcription-and-reporting otherwise. `transcribe_lock`, `source`, and
+    `session` are passed through to transcribe_segment_and_report() -- see
+    its docstring.
     """
-    duration_seconds = segment_duration_seconds(audio_bytes)
+    duration_seconds = segment_duration_seconds(closed_segment.audio_bytes)
     if duration_seconds < MIN_SEGMENT_SECONDS_TO_TRANSCRIBE:
-        print(f"Skipping {duration_seconds:.2f}s segment: below minimum duration, likely not real speech")
+        print(f"Skipping {duration_seconds:.2f}s {source} segment: below minimum duration, likely not real speech")
         return
-    asyncio.create_task(transcribe_segment_and_report(model, writer, audio_bytes, session))
+    asyncio.create_task(
+        transcribe_segment_and_report(
+            model, transcribe_lock, writer, closed_segment.audio_bytes, source, closed_segment.started_at, session
+        )
+    )
 
 
-def handle_audio_chunk(tracker, session, message):
+def handle_audio_chunk(audio_trackers, transcribe_lock, session, message):
     """
     Decodes one audio_chunk message, adds its volume to the running
-    one-second stats, and feeds it (converted to the common 16kHz mono
-    format) into the session's speech segmenter. Any speech segment just
-    closed is handed off to handle_finished_segment() along with the
-    session, so a finished transcript can feed the suggestion trigger.
-    Transcribes with whichever Whisper model this session was started with
-    (session.model) -- never the manager's current model directly, since
-    that could have moved on to a different size for a later session (not
-    possible today, since the model size isn't session-configurable, but
-    keeps this correct if that ever changes again).
+    one-second stats for whichever source it's tagged with, and feeds it
+    (converted to the common 16kHz mono format) into that source's own
+    speech segmenter (session.segmenters -- mic and loopback each get an
+    independent VoiceSegmenter, so one source's speech/pauses never affect
+    the other's segment boundaries). Any speech segment just closed is
+    handed off to handle_finished_segment() along with `transcribe_lock`,
+    the source, and the session, so a finished transcript can feed the
+    suggestion trigger. Transcribes with whichever Whisper model this
+    session was started with (session.model) -- never the manager's
+    current model directly, since that could have moved on to a different
+    size for a later session (not possible today, since the model size
+    isn't session-configurable, but keeps this correct if that ever
+    changes again). A message carrying an unrecognized `source` is logged
+    and dropped, the same defensive treatment decode_audio_chunk() already
+    gives an unrecognized sample_format -- windows_app is the only client
+    and always sends one of AUDIO_SOURCES, so this should never trigger in
+    practice.
     """
+    source = message.get("source")
+    segmenter = session.segmenters.get(source)
+    if segmenter is None:
+        print(f"Audio: unrecognized source {source!r}, dropping chunk")
+        return
+
     samples = decode_audio_chunk(message)
     if samples is None:
         return
-    tracker.record(samples)
+    audio_trackers[source].record(samples)
 
     audio_bytes = convert_audio_to_common_format(samples, message["sample_rate"], message["channels"])
-    for segment in session.segmenter.add_audio(audio_bytes):
-        handle_finished_segment(session.model, session.writer, segment, session)
+    for closed_segment in segmenter.add_audio(audio_bytes):
+        handle_finished_segment(session.model, transcribe_lock, session.writer, closed_segment, source, session)
 
 
 def default_settings():
@@ -533,8 +679,9 @@ async def handle_client(model_manager, reader, writer):
     the one setting that's different, since it's meant to be flipped live
     mid-session (see SuggestionTrigger.set_auto_suggest_enabled) rather
     than only taking effect on the next session. Starting a session creates
-    a fresh MeetingSession (fresh segmenter, fresh claude CLI process,
-    empty transcript context) using those settings, so no state bleeds
+    a fresh MeetingSession (fresh segmenters -- one per audio source, fresh
+    claude CLI process, empty transcript context) using those settings, so
+    no state bleeds
     across sessions; stopping one flushes whatever segment was still open
     (see the session_stopped branch below) so a sentence still being
     spoken right as the session stops isn't silently dropped, then tears
@@ -551,7 +698,7 @@ async def handle_client(model_manager, reader, writer):
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
-    audio_tracker = AudioLevelTracker()
+    audio_trackers = {source: AudioLevelTracker(source) for source in AUDIO_SOURCES}
     session = None
     pending_settings = None
     try:
@@ -589,24 +736,27 @@ async def handle_client(model_manager, reader, writer):
                     )
             elif message_type == "session_stopped":
                 if session is not None:
-                    # Flushes any segment still open when the session
-                    # stops (someone stops right after finishing a
-                    # sentence, before a silence gap has closed it on its
-                    # own) so it isn't silently dropped. Reported with
-                    # session=None (the default): by the time this
+                    # Flushes any segment still open, on EITHER source,
+                    # when the session stops (someone stops right after
+                    # finishing a sentence, before a silence gap has closed
+                    # it on its own) so it isn't silently dropped. Reported
+                    # with session=None (the default): by the time this
                     # transcribes, the session below is already closing,
                     # so there's no live suggestion trigger left worth
                     # feeding it into -- it's still shown in the
                     # transcript pane either way.
-                    leftover_audio = session.segmenter.close_open_segment()
-                    if leftover_audio is not None:
-                        handle_finished_segment(session.model, session.writer, leftover_audio)
+                    for source, segmenter in session.segmenters.items():
+                        leftover_segment = segmenter.close_open_segment()
+                        if leftover_segment is not None:
+                            handle_finished_segment(
+                                session.model, model_manager.transcribe_lock, session.writer, leftover_segment, source
+                            )
                     await session.close()
                     session = None
                 print("Session stopped")
             elif message_type == "audio_chunk":
                 if session is not None:
-                    handle_audio_chunk(audio_tracker, session, message)
+                    handle_audio_chunk(audio_trackers, model_manager.transcribe_lock, session, message)
             elif message_type == "hotkey_triggered":
                 if session is not None:
                     print("Hotkey pressed: generating a suggestion now")
@@ -646,6 +796,80 @@ async def run_server(model_manager):
         await server.serve_forever()
 
 
+# Shared by both mode instructions below (RESPOND_WITH_LEAD_AND_BULLETS_
+# INSTRUCTION and INTERVIEW_RESPOND_INSTRUCTION). Added Day 19, after real
+# mic-capture testing produced a suggestion that abandoned the required
+# lead+bullets shape entirely to comment on the input instead: "This is a
+# direct technical/definitional question, so answer it straight — a clear
+# definition first, not a story. Ignore the noisy transcript lines above,
+# that's just mic/transcription garbage." That's a real, reproducible
+# category of failure specific to feeding the model formatted, labeled
+# transcript text (the new "You: ...\nThem: ..." shape both sources'
+# rolling context is built from, see MeetingSession._format_context) rather
+# than one continuous plain-text blob: the model apparently reads the
+# labeled, multi-line shape as something closer to a document to react to
+# than plain conversational context, and both mode instructions' existing
+# generic "no meta-commentary" line wasn't specific enough to rule out
+# commentary about the *input's own quality* as a special case worth
+# surfacing anyway. The same session's very first suggestion showed a
+# milder version of the same underlying looseness -- a bare single
+# sentence with no bullets at all, for a genuinely thin/early exchange --
+# so this also explicitly rules out that fallback. Naming the exact
+# failure mode observed, rather than just generically re-emphasizing "no
+# meta-commentary," matches this project's own established fix pattern for
+# prompt-shape corner cases (see INTERVIEW_RESPOND_INSTRUCTION's own Day 18
+# revision history below).
+IGNORE_TRANSCRIPT_NOISE_INSTRUCTION = (
+    "The transcript excerpt below is real-time automatic speech-to-text, "
+    "labeled by who's speaking -- it will sometimes contain misheard "
+    "words, garbled fragments, or lines that don't make sense in context. "
+    "That's expected and not something to point out: silently work around "
+    "anything that looks like a transcription error, use whatever real "
+    "content is there, and never comment on transcript quality, mention "
+    "noise, errors, garbled text, or transcription in your answer. This "
+    "applies no matter how thin, early, or awkward the exchange looks -- "
+    "always answer in the exact format below, never a bare sentence, "
+    "single paragraph, or any other shape instead of it."
+)
+
+# Shared by both mode instructions, same as IGNORE_TRANSCRIPT_NOISE_
+# INSTRUCTION above. Added Day 19, from a real user-reported example: asked
+# to walk through HTTP caching, the suggestion's lead and every one of its
+# bullets were meta-instructions about what to cover ("Explain the basic
+# idea...", "Cover cache-control headers like max-age, no-cache, and
+# no-store", "Mention validation methods such as ETag and Last-Modified")
+# rather than the actual explanation content itself -- technically the
+# right shape (a lead plus bullets), but each line told the user what to
+# say instead of giving them something to say. Reproduced directly against
+# the real CLI afterward (meeting mode specifically): the lead came back as
+# "Give a clear step-by-step walkthrough of..." / "Explain that
+# invalidation is more about..." -- second-person meta-advice, not content
+# in the user's own voice, even though the existing "specific details... "
+# bullet wording was already fairly explicit. The real fix needed to be
+# concrete (a named good/bad example, using the user's own real report)
+# rather than another abstract adjective, matching this project's own
+# established pattern for prompt-shape fixes -- see INTERVIEW_RESPOND_
+# INSTRUCTION's Day 18 revision history below for the same lesson learned
+# earlier.
+CONTENT_NOT_OUTLINE_INSTRUCTION = (
+    "Every line of the answer -- the lead and every bullet -- must BE "
+    "actual content: a real fact, term, number, or example, in the user's "
+    "own voice, as if they were saying it out loud. Never write a line "
+    "that just names a topic or instructs the user what to say -- that's "
+    "an outline, not an answer, and it leaves the user to supply the real "
+    "content themselves instead of giving it to them. For example, if "
+    "asked to explain HTTP caching, do NOT write a bullet like \"Cover "
+    "cache-control headers like max-age, no-cache, and no-store\" -- "
+    "write the real content directly instead, e.g. \"max-age sets how "
+    "many seconds a response stays fresh; no-cache forces revalidation "
+    "with the server before reuse; no-store disables caching entirely.\" "
+    "A line that starts with a verb like \"Explain\", \"Cover\", "
+    "\"Mention\", \"Discuss\", \"Note\", or \"Describe\", and could be "
+    "rewritten by deleting that verb without losing any information, is "
+    "an outline line -- rewrite it to contain the actual substance "
+    "instead."
+)
+
 # The framing given to every prompt sent through a session's ClaudeCli,
 # chosen per session by mode (see MeetingSession). Both end with the same
 # instruction. Originally (Day 6) this asked for a single ready-to-read
@@ -666,8 +890,10 @@ async def run_server(model_manager):
 RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION = (
     "Respond in plain text only — no markdown headers, bold, or numbered "
     "lists — in exactly this shape:\n\n"
-    "First, a lead of 1-2 sentences: the general framing of how the user "
-    "could respond, written in plain spoken language.\n"
+    "First, a lead of 1-2 sentences: the actual start of what the user "
+    "could say out loud, in their own voice, as if they were speaking it "
+    "right now -- not a description of how they should respond or what "
+    "they should cover.\n"
     "Then, a blank line, followed by 3-5 bullet points, each on its own "
     "line starting with \"- \" — specific details, angles, reasons, or "
     "examples the user could pull from to build their actual answer. One "
@@ -676,7 +902,9 @@ RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION = (
     "The user will skim the lead, then pick whichever bullets actually fit "
     "what they want to say — this is not a fixed script to read back "
     "verbatim. Keep the lead and each bullet short enough to skim in a few "
-    "seconds; no meta-commentary, no multiple alternative versions."
+    "seconds; no meta-commentary, no multiple alternative versions.\n\n"
+    + CONTENT_NOT_OUTLINE_INSTRUCTION + "\n\n"
+    + IGNORE_TRANSCRIPT_NOISE_INSTRUCTION
 )
 
 MEETING_SYSTEM_PROMPT = (
@@ -743,7 +971,9 @@ INTERVIEW_RESPOND_INSTRUCTION = (
     "Either way: one point per line, no sub-bullets, no further "
     "punctuation before the dash, formal tone, complete but not sprawling "
     "-- meant to be read nearly as-is, not a skimmable list of options. No "
-    "meta-commentary, no multiple alternative versions."
+    "meta-commentary, no multiple alternative versions.\n\n"
+    + CONTENT_NOT_OUTLINE_INSTRUCTION + "\n\n"
+    + IGNORE_TRANSCRIPT_NOISE_INSTRUCTION
 )
 
 INTERVIEW_SYSTEM_PROMPT = (
@@ -815,6 +1045,28 @@ class ClaudeCli:
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            # Found live, Day 19: without an explicit cwd, this subprocess
+            # inherits wsl_app's own working directory, which sits inside
+            # this project -- and the claude CLI auto-discovers and loads
+            # this project's own CLAUDE.md into context regardless of
+            # --system-prompt (that flag only replaces the top-level system
+            # framing; CLAUDE.md auto-discovery is a separate mechanism it
+            # doesn't disable). Confirmed directly: the exact same prompts
+            # sent from this project's own directory produced suggestions
+            # that referenced this project's own dev history ("Day 18
+            # note on INTERVIEW_SYSTEM_PROMPT", "project_notes.md",
+            # "live-verification gap") instead of answering the actual
+            # question -- a real, reproducible contamination bug, not a
+            # one-off. Re-running the identical prompts with cwd pointed
+            # outside the project (a plain temp directory, verified to have
+            # no CLAUDE.md of its own anywhere up its path) eliminated it
+            # completely across every case tested. This has likely been a
+            # latent risk since Day 6 (ClaudeCli has always run without an
+            # explicit cwd), only surfacing visibly now because real
+            # conversation content can resemble topics this now-large (29KB+)
+            # CLAUDE.md happens to discuss (e.g. "SQL injection",
+            # "interview question") closely enough to get pulled in.
+            cwd=tempfile.gettempdir(),
         )
         threading.Thread(target=self._log_error_output, daemon=True).start()
 
@@ -1018,9 +1270,11 @@ class MeetingSession:
     """
     Everything that lives for the span of one meeting session — from
     session_started to session_stopped — and needs to be created fresh
-    each time and cleanly torn down together: speech segmentation, the
-    running claude CLI process behind it, the pause/hotkey suggestion
-    trigger, and a short rolling history of recent transcript segments to
+    each time and cleanly torn down together: speech segmentation (one
+    independent VoiceSegmenter per audio source -- see self.segmenters),
+    the running claude CLI process behind it, the pause/hotkey suggestion
+    trigger, and a short rolling history of recent transcript segments (from
+    both sources, chronologically ordered -- see add_transcript_segment) to
     give suggestions context. If the claude CLI process crashes mid-session,
     one restart is attempted automatically (see _ask_with_restart_on_crash)
     — recent_transcript_segments lives here, not in ClaudeCli, so a restart
@@ -1030,16 +1284,24 @@ class MeetingSession:
     def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=True):
         """
         Starts a fresh session using the settings captured for it at
-        session_started (see handle_client): a new segmenter, `model` as
-        the Whisper model this session transcribes with for its entire
-        lifetime, a new claude CLI process framed for `mode` and
-        `context_notes`, empty transcript history, and a suggestion
-        trigger using `pause_seconds` and starting with auto-suggest set to
-        `auto_suggest_enabled`.
+        session_started (see handle_client): a fresh VoiceSegmenter per
+        audio source, each using that source's own VAD strictness (see
+        SPEECH_DETECTION_STRICTNESS_BY_SOURCE -- mic and loopback each need
+        their own segmenter and strictness, so one source's speech/pauses
+        never affect the other's segment boundaries), `model` as the
+        Whisper model this session transcribes
+        with for its entire lifetime, a new claude CLI process framed for
+        `mode` and `context_notes`, empty transcript history, and a
+        suggestion trigger using `pause_seconds` and starting with
+        auto-suggest set to `auto_suggest_enabled`.
         """
         self.writer = writer
         self.model = model
-        self.segmenter = VoiceSegmenter()
+        self.segmenters = {
+            source: VoiceSegmenter(SPEECH_DETECTION_STRICTNESS_BY_SOURCE[source]) for source in AUDIO_SOURCES
+        }
+        # Each entry is (started_at, source, text), kept sorted by
+        # started_at -- see add_transcript_segment().
         self.recent_transcript_segments = []
         self._system_prompt = build_system_prompt(mode, context_notes)
         print(f"Starting claude CLI process for this session (mode: {mode})...")
@@ -1057,17 +1319,45 @@ class MeetingSession:
         """Turns this session's pause-triggered suggestions on or off, live. See SuggestionTrigger.set_auto_suggest_enabled."""
         self.trigger.set_auto_suggest_enabled(enabled)
 
-    def add_transcript_segment(self, text):
+    def add_transcript_segment(self, source, text, started_at):
         """
-        Adds one newly-transcribed segment to the rolling context window,
-        dropping the oldest once there are more than
-        SEGMENTS_TO_KEEP_FOR_CONTEXT, and lets the suggestion trigger know
-        new content has arrived.
+        Adds one newly-transcribed segment -- tagged with which audio
+        source it came from and when it started being spoken -- to the
+        rolling context window, then lets the suggestion trigger know new
+        content has arrived. Inserted in started_at order (bisect.insort)
+        rather than just appended, since mic and loopback transcribe
+        independently and can finish in a different order than they were
+        actually spoken in (e.g. a longer segment on one source started
+        first but takes longer to transcribe than a shorter segment on the
+        other) -- this keeps the context Claude sees in the same
+        chronological order the conversation actually happened in, not
+        transcription-completion order. See _trim_context_to_budget() for
+        how the window is kept bounded.
         """
-        self.recent_transcript_segments.append(text)
-        if len(self.recent_transcript_segments) > SEGMENTS_TO_KEEP_FOR_CONTEXT:
-            self.recent_transcript_segments.pop(0)
+        bisect.insort(self.recent_transcript_segments, (started_at, source, text))
+        self._trim_context_to_budget()
         self.trigger.notify_new_segment()
+
+    def _trim_context_to_budget(self):
+        """
+        Drops the oldest kept segments, one at a time, until the formatted
+        context text (see _format_context) fits within
+        CONTEXT_CHARACTER_BUDGET -- always leaves at least one segment,
+        even if that one segment alone exceeds the budget, so a single
+        long segment can't empty the context entirely.
+        """
+        while len(self.recent_transcript_segments) > 1 and len(self._format_context()) > CONTEXT_CHARACTER_BUDGET:
+            self.recent_transcript_segments.pop(0)
+
+    def _format_context(self):
+        """
+        Returns:
+            str: the rolling transcript context formatted for the claude
+            prompt -- one labeled line per kept segment (e.g. "Them: ...",
+            "You: ...", see SOURCE_LABELS), in chronological order, so the
+            model can tell who said what.
+        """
+        return "\n".join(f"{SOURCE_LABELS[source]}: {text}" for _started_at, source, text in self.recent_transcript_segments)
 
     async def _generate_and_send_suggestion(self):
         """
@@ -1110,7 +1400,7 @@ class MeetingSession:
         if self._claude_cli_lock.locked():
             return
         async with self._claude_cli_lock:
-            prompt_text = " ".join(self.recent_transcript_segments)
+            prompt_text = self._format_context()
             if not prompt_text:
                 return
             loop = asyncio.get_running_loop()
@@ -1206,10 +1496,11 @@ class MeetingSession:
         any suggestion currently being generated to finish (so the claude
         CLI process's stdin is never closed out from under an in-flight
         ask()), then stops the process on a background thread. Any segment
-        still open in self.segmenter is flushed by the caller (see
-        handle_client's session_stopped branch) before this is called, not
-        here -- flushing kicks off its own background transcribe-and-report
-        task, which doesn't need to (and shouldn't) block session teardown.
+        still open in self.segmenters (either source) is flushed by the
+        caller (see handle_client's session_stopped branch) before this is
+        called, not here -- flushing kicks off its own background
+        transcribe-and-report task, which doesn't need to (and shouldn't)
+        block session teardown.
         """
         self.trigger.stop()
         async with self._claude_cli_lock:
