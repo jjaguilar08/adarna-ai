@@ -1,6 +1,7 @@
 # Python virtual environments
 windows_app/.venv/
 wsl_app/.venv/
+wsl_app/research/day20/whisperx_venv/
 
 # Python bytecode
 __pycache__/

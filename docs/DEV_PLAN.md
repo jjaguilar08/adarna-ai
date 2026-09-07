@@ -592,7 +592,104 @@ Added 2026-09-07, pulled forward ahead of persistence (now Day 21) per Jon's req
 
 **Done when:** you have real numbers (not documentation-only claims) on both tracks — whether the fast-speech-segmentation approach measurably helps the "nothing shown for a long stretch" problem without the previous streaming attempts' failure modes, and whether WhisperX (or any real alternative) offers a measurable accuracy or latency win over `small.en` on real (not just TTS) audio — with a clear recommendation for each, before any pipeline code changes.
 
-## Day 21 — Opt-in Session Persistence (Phase 2, part 3)
+**Actual outcome, 2026-09-07: Track A — yes, build it, but only with an accompanying fix; Track B —
+hold off.** Full numbers and methodology in `wsl_app/research/day20/README.md`; summary below.
+
+**Track A.** The core idea (a shorter force-close threshold during continuous/fast speech) delivers
+a real win at 16s: `fast_long.wav`'s time-to-first-text drops from 50.3s to 21.5s with *better* WER
+(5.6% vs 6.8%) than the current 60s threshold, zero regression on clips with natural pauses. But
+shorter, more responsive thresholds (8s/12s) reintroduced real, severe content loss on the exact
+clip the change targets — WER up to 45.2% at 8s, whole clauses silently vanishing. Root-caused
+directly (`track_a_diagnose_boundary_loss.py`): the missing audio is real, clearly-spoken speech
+that Whisper transcribes correctly on its own, but `NO_SPEECH_PROBABILITY_THRESHOLD` (tuned Day 18
+for a different problem — real silence at session-stop) spuriously fires on any chunk whose edges
+don't land on a natural pause, and `transcribe_filtered()` drops the whole segment. This is a new,
+fourth failure mode, not one of the three the original framing assumed this approach would avoid
+structurally. The fix (skip that one filter specifically on forced-close segments, since the
+segmenter already knows a given close wasn't a real pause) was implemented and verified
+(`track_a_boundary_safe_fix.py`): `fast_long` at 8s recovers to 7.2% WER (vs. 6.8% baseline) while
+keeping the ~80% latency win. One smaller residual risk remains even with the fix — a mid-sentence
+cut can still occasionally make Whisper fabricate a short clause rather than drop content, a milder
+version of the same known "boundary-decode fragility" class, not something this specific fix
+addresses. **Recommendation: build it, with the boundary-safe filter change as a required part of
+the same change, not a follow-up** — the naive version is a real regression on its own target case.
+
+**Track B.** WhisperX (Silero VAD, no HuggingFace token needed) benchmarked directly against this
+app's real production `transcribe_filtered()`/`small.en` call, same checkpoint, CPU-only, isolated
+venv (`research/day20/whisperx_venv/`, kept out of the main `wsl_app` venv to avoid destabilizing
+the working STT path). Accuracy: essentially identical (same WER on 3/4 clips, marginally better on
+one). Batching: confirmed to not help this app's usage pattern, as the pre-spike research predicted
+— WhisperX's own VAD only found 1-2 internal chunks per ~40s clip (this app hands it one
+already-closed utterance at a time, not a backlog of many short clips), so `batch_size` 1 vs. 4 vs.
+8 moved latency by only a few percent, within noise. There is a real, if modest, latency win
+independent of batching (7-15% faster even at `batch_size=1`, most likely from WhisperX's own VAD
+trimming silence at each chunk's edges before decoding) — but it's achievable directly in this app's
+existing pipeline (trim each closed segment's leading/trailing near-silence before transcribing,
+reusing `SILENCE_AMPLITUDE_THRESHOLD`'s existing approach) without adopting WhisperX's ~3GB
+`torch`/`pyannote-audio`/`transformers` dependency tree for a benefit that doesn't need it.
+**Recommendation: hold off** — real caveat, same as every prior model-comparison day: this was all
+TTS audio, no real mic recording was available to test against (Day 19 makes real capture possible,
+but none exists yet in the repo and this research session had no way to record one itself, same
+class of gap as every prior real-physical-action item in this project) — provisional until a real
+recording is tested, but not a reason to adopt WhisperX on what was actually measured here.
+
+## Day 21 — Rolling Transcript: Implementation (fast-speech-aware segmentation + boundary-safe fix)
+
+Added 2026-09-07, scoped directly from Day 20's Track A recommendation — implementation, not
+another research day. Bumped ahead of persistence (now Day 22), same kind of reprioritization as
+Day 19/20 getting pulled forward earlier — Track A's fix is verified and ready to port, not worth
+sitting on.
+
+**The two pieces land together, not sequentially** — Day 20 found the naive version (a shorter
+force-close threshold alone) is a real regression on its own target case (severe content loss on
+continuous fast speech) unless paired with the filter fix. Shipping one without the other
+reintroduces the exact bug Day 20 spent most of its time on.
+
+- `VoiceSegmenter`'s force-close threshold moves from `MAX_SEGMENT_SECONDS = 60.0` down into the
+  8-12s range Day 20 benchmarked as the responsive, "actually doesn't wait for a pause" target (16s
+  is the zero-observed-risk fallback if 8-12s feels too aggressive once live — Day 20's own numbers
+  cover both). **Read the history in `wsl_app/main.py`'s `MAX_SEGMENT_SECONDS` comment before
+  touching it**: it was deliberately *raised* from 20.0 to 60.0 on Day 18 specifically because a
+  short forced cut was hurting accuracy on real interview answers. Day 20 isn't blindly reverting
+  that — it found and fixed the actual mechanism behind that harm (see the filter fix below), so
+  lowering the threshold again is now safe in a way it wasn't on Day 18. Worth stating this
+  explicitly in whatever comment replaces the current one, so a future reader doesn't see a lowered
+  threshold and assume the Day 18 finding was forgotten.
+- The segmenter needs to tell the caller whether a given closed segment ended on a real pause or a
+  forced timeout (`ClosedSegment` gains a field, or equivalent) — `transcribe_segment()` needs that
+  to decide whether to skip the filter below.
+- `streaming_transcriber.py`'s `transcribe_filtered()` (or a variant) needs to skip
+  `NO_SPEECH_PROBABILITY_THRESHOLD` specifically for forced-close segments, while keeping
+  `AVG_LOGPROB_THRESHOLD` and `SILENCE_AMPLITUDE_THRESHOLD` active unconditionally — neither of
+  those was the culprit Day 20 found, both still catch genuine hallucination/silence.
+- **Working, verified reference implementation already exists** — `wsl_app/research/day20/
+  track_a_boundary_safe_fix.py` (the segmenter-threshold change) and `track_a_diagnose_boundary_loss.py`
+  (the root-cause diagnostic that explains *why*) — port the logic from there into
+  `wsl_app/main.py`/`streaming_transcriber.py` properly rather than re-deriving it, but this is
+  production code now: give it real docstrings and plain naming per this project's conventions,
+  not a straight copy-paste of research-script style.
+- One residual risk Day 20 flagged and did *not* fix, worth being aware of rather than surprised by:
+  a mid-sentence forced cut can still occasionally make Whisper fabricate a short clause instead of
+  dropping content (seen once, Day 20, `zira_clip` at an 8s threshold) — a milder instance of this
+  project's standing "decoding a partial/boundary-aligned slice is inherently fragile" knowledge, not
+  something this specific fix addresses. Not a blocker, just don't be surprised if it shows up in
+  live testing.
+- **Live verification required, not just a benchmark re-run** — per this project's own established
+  rule, a pipeline behavior change needs real verification against actual behavior before it's done.
+  Day 20's numbers are all TTS; test the real implemented change in a real running session, ideally
+  using Day 19's real mic/loopback capture rather than only TTS, and specifically include at least
+  one long, unbroken stretch of continuous speech (the exact scenario this whole change targets) —
+  confirm text visibly appears well before the old 60s cap would have, with no dropped or fabricated
+  content versus the prior whole-segment behavior.
+- **Out of scope**: Track B (WhisperX) — Day 20's recommendation there was hold off, not part of
+  this day's work.
+
+**Done when:** a real session with a long, unbroken run of speech (mic or loopback, not just TTS)
+shows transcript text appearing well before the old 60s cap would have, and a side-by-side check
+against the prior whole-segment behavior on that same real speech shows no observable content loss
+or fabrication introduced by the shorter threshold.
+
+## Day 22 — Opt-in Session Persistence (Phase 2, part 3)
 
 - Explicit, off-by-default setting to save transcript + suggestions from a session to a local file.
 - Off unless turned on, per PRD §5/§9's privacy stance — no behavior change for anyone who leaves it alone.
