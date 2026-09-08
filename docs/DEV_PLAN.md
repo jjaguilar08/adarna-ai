@@ -736,6 +736,45 @@ or fabrication introduced by the shorter threshold.
 
 </details>
 
+## Day 22 — Opt-in Session Persistence (Phase 2, part 3) ✅ implemented and live-verified
+
+Implemented entirely in `windows_app/main.py`, exactly as scoped below: a new `SessionRecorder`
+class, a "Save this session's transcript to a file" checkbox in `create_settings_panel()` (unchecked
+by default, read once at Start Session), `windows_app/sessions/` added to `.gitignore`, and a
+window-title indicator (`Adarna (saving session to disk)`) shown for the duration of a recorded
+session.
+
+**Live-verified against the real GUI, not just read through** — a real session needs real audio and
+the real `claude` CLI, neither in scope for this change, so verification used a small scripted fake
+`wsl_app` TCP server standing in for the real one (same wire protocol, sending real-shaped
+`transcript`/`suggestion` messages on a timer) while driving the actual `windows_app/main.py` through
+this project's established WSL→Windows interop (real Windows `python.exe`, PowerShell UI Automation
+clicking Start/Stop Session for real — see `feedback_verify_interop_before_assuming_unavailable`
+memory). Confirmed: with the checkbox off, a full session start/stop wrote nothing to
+`windows_app/sessions/`; with it on, the window title switched to the recording indicator during the
+session and reverted after Stop, and the resulting file was a complete, readable chronological log —
+header (start time + mode), source-labeled/timestamped transcript lines in real arrival order, the
+suggestion tagged with the question that prompted it, footer with the end time.
+
+**Follow-up, same session, user-requested:** "You"/"Them" transcript lines are now right/left-aligned
+respectively in the transcript pane (chat-bubble style), so the two sides of a conversation are
+visually distinguishable without reading each line's label. A real, non-obvious finding surfaced
+getting there: `QPlainTextEdit` (the pane's original widget) silently ignores `QTextCursor` per-block
+paragraph alignment entirely. Confirmed directly with an isolated side-by-side test — the *exact
+same* formatting code (`QTextBlockFormat.setAlignment()` + `QTextCursor.setBlockFormat()`) produces
+correctly right-aligned text in a `QTextEdit`, but renders flush-left regardless of the format set in
+a `QPlainTextEdit`, even though `document().findBlockByNumber(n).blockFormat().alignment()` confirms
+the format *was* stored correctly — no error, no other visible sign anything was wrong, just silently
+not applied at paint time. Fixed by switching only the transcript pane (not the suggestions pane,
+which stays `QPlainTextEdit`) to `QTextEdit`, via a new `widget_class` parameter on
+`create_readonly_text_pane()`. Worth remembering for any future per-line/per-paragraph formatting need
+in this app: `QPlainTextEdit` exposes the same `QTextCursor`/block-format API as `QTextEdit` and looks
+fully capable of it, but doesn't actually apply block-level formatting at render time — reach for
+`QTextEdit` from the start whenever a plain-text pane needs anything beyond uniform whole-document
+formatting.
+
+<details><summary>Original Day 22 scope (for reference)</summary>
+
 ## Day 22 — Opt-in Session Persistence (Phase 2, part 3)
 
 Scope per PRD §5/§9's privacy stance (RA 4200 anti-wiretapping consent law is the underlying reason):
@@ -784,3 +823,60 @@ open the resulting file to confirm it's complete and readable — not just that 
 explicitly turned on for a real session, that session's transcript and suggestions are saved locally
 in a file that can be found and opened afterward, and reads as a complete, readable record of what
 actually happened.
+
+</details>
+
+## Day 23 — Post-Meeting Summary Generation (Phase 3)
+
+Scope per PRD §8 Phase 3: after a session ends, generate a written summary (key points, decisions,
+action items) via the `claude` CLI, and let the user export it to a local markdown/txt file.
+
+**Design call, made here rather than left open: source the summary from `windows_app`'s full
+in-session transcript, not from `wsl_app`'s own rolling context window.** `MeetingSession.
+recent_transcript_segments` (`wsl_app/main.py`) is deliberately a *bounded* window — trimmed by
+`_trim_context_to_budget()` down to `CONTEXT_CHARACTER_BUDGET` on every new segment, sized for live
+suggestion context, not a full-session record. By the time a real meeting ends, most of its early
+content has already been dropped there; asking wsl_app for a summary using that state would silently
+summarize only the last few minutes, not the whole meeting. `windows_app`'s `TranscriptDisplay.
+_segments`, by contrast, keeps every segment for the whole session — only `reset()` clears it, at the
+next Start Session — and, since Day 22, is the same complete record `SessionRecorder` already knows
+how to write to disk. So: `windows_app` is the side that actually has the data this feature needs;
+generation should still run through wsl_app's existing `ClaudeCli` (the only thing in this
+architecture that talks to the `claude` CLI), but fed the full transcript `windows_app` sends it, not
+anything wsl_app already had lying around.
+
+- New message type `generate_summary` (`windows_app` → `wsl_app`): carries the full session
+  transcript, formatted the same source-labeled, chronological way `_format_context()` already does.
+  `wsl_app` runs it through `ClaudeCli.ask()` (reusing the existing CLI process and its
+  `_claude_cli_lock` — not a second subprocess) against a new summary-specific system prompt (key
+  points / decisions / action items) — decide during implementation whether this is one shared prompt
+  or per-mode like `MEETING_SYSTEM_PROMPT`/`INTERVIEW_SYSTEM_PROMPT` already are. Sends the result
+  back as a new `summary` message (`wsl_app` → `windows_app`).
+- `windows_app`: a "Generate Summary" button — disabled during an active session (there's no complete
+  transcript yet), enabled once one has ended and there's something to summarize, same enabled-state
+  pattern Start/Stop Session already uses — plus a pane (or dialog) to show the result once it
+  arrives.
+- Export to markdown/txt: a "Save Summary" button/file dialog once a summary has been generated. A
+  single one-shot write, not something arriving incrementally — no need to route it through
+  `SessionRecorder`'s live-append machinery (Day 22), a plain file write is enough.
+- Privacy, same stance as Day 22 (PRD §5/§9): the summary is a text artifact like the transcript,
+  fine to save locally when the user explicitly asks, but nothing should be written automatically —
+  saving still needs its own explicit action, not something that happens just because a session
+  ended.
+
+**Live verification required, not just a read-through** — same established rule as every prior day.
+Run a real session with a few varied transcript lines — **varied by question/topic type, not just
+varied wording** (see this project's own Day 12/18 lesson: a verification pass that only tests one
+input shape can pass cleanly while a real different shape still breaks) — stop it, generate a summary,
+and read it against what was actually said before trusting it's accurate; then export and open the
+saved file to confirm it's complete and readable.
+
+**Done when:** after a real session, a summary (key points/decisions/action items) can be generated on
+demand from that session's actual full transcript (not a trimmed window), reviewed in-app, and
+exported to a local markdown/txt file that reads as a correct, complete record of the session.
+
+**Still open, not part of this day's scope:** two real-mic live-verification items flagged in earlier
+days remain unconfirmed — Day 19's mic-noise-hallucination and transcribe-concurrency fixes, and Day
+21's fast-speech segmentation change — both need the user's own hands with real mic/loopback audio,
+the same class of gap as this project's prior hotkey/drag-test items. Worth doing at the first real
+opportunity, independent of whichever of Day 23 or these gets picked up next.

@@ -16,3 +16,7 @@ Thumbs.db
 # Local running notes, never pushed
 project_notes.md
 CLAUDE.md
+
+# Saved session transcripts (opt-in, Day 22) -- real conversation content,
+# must never be committed
+windows_app/sessions/

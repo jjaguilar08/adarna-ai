@@ -11,6 +11,7 @@ from pathlib import Path
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QTextBlockFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizeGrip,
     QSlider,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +37,17 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 PING_INTERVAL_SECONDS = 2
 RECONNECT_DELAY_SECONDS = 2
 CHUNK_SECONDS = 0.1
+
+# Where opt-in session transcripts (Day 22, see SessionRecorder) are saved --
+# under windows_app/ itself, not wsl_app, so the file lands somewhere the
+# user would actually look for it (Windows Explorer), not the WSL filesystem.
+SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
+
+# Window title shown while a session is being saved to disk (see
+# SessionRecorder) -- the feature exists for a consent/privacy reason (PRD
+# §5/§9, RA 4200), so it shouldn't be silently invisible once turned on.
+DEFAULT_WINDOW_TITLE = "Adarna"
+RECORDING_WINDOW_TITLE = "Adarna (saving session to disk)"
 
 # How long the capture loop waits for the next audio block before checking
 # whether it's been told to stop. Keeps Stop Session/a device switch
@@ -123,6 +136,15 @@ AUDIO_SOURCE_LOOPBACK = "loopback"
 TRANSCRIPT_SOURCE_LABELS = {
     AUDIO_SOURCE_MIC: "You",
     AUDIO_SOURCE_LOOPBACK: "Them",
+}
+
+# Which side of the transcript pane each source's lines are aligned to (Day
+# 22 follow-up, user-requested): "You" on the right, "Them" on the left, so
+# the two sides of a conversation read visually distinct at a glance, the
+# same left/right convention chat apps use for "me" vs. "everyone else."
+TRANSCRIPT_SOURCE_ALIGNMENT = {
+    AUDIO_SOURCE_MIC: Qt.AlignRight,
+    AUDIO_SOURCE_LOOPBACK: Qt.AlignLeft,
 }
 
 
@@ -529,7 +551,7 @@ def create_window():
         QMainWindow: the configured top-level window.
     """
     window = QMainWindow()
-    window.setWindowTitle("Adarna")
+    window.setWindowTitle(DEFAULT_WINDOW_TITLE)
     window.resize(800, 600)
     return window
 
@@ -610,7 +632,7 @@ def create_session_buttons(layout):
     return start_button, stop_button
 
 
-def create_readonly_text_pane(layout):
+def create_readonly_text_pane(layout, widget_class=QPlainTextEdit):
     """
     Adds a scrolling, read-only text pane to layout -- the shared shape
     behind the transcript pane and the suggestions pane, so the two don't
@@ -619,10 +641,20 @@ def create_readonly_text_pane(layout):
     instead, both for the visual redesign and so a click on top of the
     text still drags the window (see OverlayWindow._add_labeled_section).
 
+    `widget_class` defaults to QPlainTextEdit (used by the suggestions
+    pane); create_transcript_pane() passes QTextEdit instead, since only
+    QTextEdit actually honors per-line paragraph alignment (see
+    TranscriptDisplay._render()) -- confirmed directly, live, that
+    QPlainTextEdit silently ignores QTextCursor block-alignment formatting
+    entirely (its own QPlainTextDocumentLayout doesn't apply it, unlike
+    QTextEdit's QTextDocumentLayout), rather than erroring or applying it
+    incorrectly. Both classes share the read-only/scrolling/textCursor()
+    API this app uses, so the swap is otherwise a drop-in one.
+
     Returns:
-        QPlainTextEdit: the pane, already added to layout.
+        QWidget: the pane (an instance of `widget_class`), already added to layout.
     """
-    pane = QPlainTextEdit()
+    pane = widget_class()
     pane.setReadOnly(True)
     layout.addWidget(pane)
     return pane
@@ -632,13 +664,15 @@ def create_transcript_pane(layout):
     """
     Adds a labeled, scrolling, read-only pane that displays the transcript
     as it arrives from wsl_app. See TranscriptDisplay for how it's kept in
-    sync with this pane.
+    sync with this pane. A QTextEdit specifically, not the shared default
+    QPlainTextEdit (see create_readonly_text_pane()) -- needed so "You"/
+    "Them" lines can be right/left-aligned.
 
     Returns:
-        QPlainTextEdit: the pane to keep in sync with incoming transcript text.
+        QTextEdit: the pane to keep in sync with incoming transcript text.
     """
     layout.addWidget(QLabel("Transcript"))
-    return create_readonly_text_pane(layout)
+    return create_readonly_text_pane(layout, widget_class=QTextEdit)
 
 
 class TranscriptDisplay(QObject):
@@ -689,10 +723,26 @@ class TranscriptDisplay(QObject):
         self._render()
 
     def _render(self):
-        """Rewrites the pane's full text from the segment list, one labeled line per segment, and scrolls to the end so newly-appended text stays visible."""
-        lines = [f"{TRANSCRIPT_SOURCE_LABELS[source]}: {text}" for _started_at, source, text in self._segments]
-        self._pane.setPlainText("\n".join(lines))
+        """
+        Rewrites the pane's full text from the segment list, one labeled
+        line per segment, and scrolls to the end so newly-appended text
+        stays visible. "You" lines are right-aligned and "Them" lines
+        left-aligned (see TRANSCRIPT_SOURCE_ALIGNMENT), so the two sides of
+        a conversation are visually distinct at a glance rather than
+        needing to read each line's label. Built block-by-block via a
+        QTextCursor rather than a single setPlainText() call, since
+        setPlainText() has no per-line formatting of its own and each line
+        here needs its own alignment depending on which source it's from.
+        """
+        self._pane.clear()
         cursor = self._pane.textCursor()
+        block_format = QTextBlockFormat()
+        for index, (_started_at, source, text) in enumerate(self._segments):
+            if index > 0:
+                cursor.insertBlock()
+            block_format.setAlignment(TRANSCRIPT_SOURCE_ALIGNMENT[source])
+            cursor.setBlockFormat(block_format)
+            cursor.insertText(f"{TRANSCRIPT_SOURCE_LABELS[source]}: {text}")
         cursor.movePosition(cursor.MoveOperation.End)
         self._pane.setTextCursor(cursor)
 
@@ -747,6 +797,72 @@ class SuggestionDisplay(QObject):
         self._suggestions_pane.setPlainText(answer)
         self._latest_suggestion.update(answer)
         self._overlay_window.update_suggestion(question, answer)
+
+
+class SessionRecorder(QObject):
+    """
+    Writes an opt-in, plain-text, human-readable log of one session's
+    transcript and suggestions to a local file under SESSIONS_DIR (Day 22,
+    PRD §5/§9's privacy stance -- RA 4200 anti-wiretapping consent). Off by
+    default and no behavior change at all unless the user checks "Save this
+    session's transcript to a file" (see create_settings_panel()); raw audio
+    is never written here or anywhere else, only the same transcript/
+    suggestion text that already reaches this app over the wire.
+
+    record_transcript()/record_suggestion() match
+    WslConnection.transcript_received/suggestion_received's own signal
+    signatures exactly, so create_session_recording() can connect them
+    directly without an intermediate lambda -- consistent with this file's
+    rule that a cross-thread signal must reach a bound method, not a lambda
+    (see OverlayToggle.toggle). Both are safe no-ops while no file is open,
+    so they can stay connected for the app's whole lifetime rather than
+    being wired/unwired per session.
+
+    Each line is flushed to disk as it's written, not buffered up to be
+    written at the end, so a crash mid-session doesn't lose an otherwise-
+    complete transcript.
+    """
+
+    def __init__(self):
+        """Starts with no file open -- start() opens one when a recorded session begins."""
+        super().__init__()
+        self._file = None
+
+    def start(self, mode_label):
+        """Opens a new timestamped file under SESSIONS_DIR and writes its header line."""
+        SESSIONS_DIR.mkdir(exist_ok=True)
+        started_at = time.localtime()
+        filename = f"session_{time.strftime('%Y-%m-%d_%H%M%S', started_at)}.txt"
+        self._file = open(SESSIONS_DIR / filename, "w", encoding="utf-8")
+        self._write(f"=== Adarna session started {time.strftime('%Y-%m-%d %H:%M:%S', started_at)} (mode: {mode_label}) ===")
+
+    def stop(self):
+        """Writes a footer line and closes the file, if one is open. A safe no-op otherwise."""
+        if self._file is None:
+            return
+        self._write(f"=== Session ended {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+        self._file.close()
+        self._file = None
+
+    def record_transcript(self, source, text, started_at):
+        """Appends one source-labeled, timestamped transcript line, if a session is currently being recorded."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S", time.localtime(started_at)) if started_at else time.strftime("%H:%M:%S")
+        self._write(f"[{timestamp}] {TRANSCRIPT_SOURCE_LABELS[source]}: {text}")
+
+    def record_suggestion(self, question, answer):
+        """Appends one timestamped suggestion (with the transcript excerpt that prompted it, if any), if a session is currently being recorded."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        label = f'Suggestion (re: "{question}")' if question else "Suggestion"
+        self._write(f"[{timestamp}] {label}: {answer}")
+
+    def _write(self, line):
+        """Writes one line to the open file and flushes immediately, so partial content already on disk survives a crash."""
+        self._file.write(line + "\n")
+        self._file.flush()
 
 
 class OverlayToggle(QObject):
@@ -1240,6 +1356,32 @@ def create_suggestions_section(layout):
     return pane, latest_suggestion
 
 
+def create_session_recorder():
+    """
+    Creates the SessionRecorder that optionally saves a session's transcript
+    and suggestions to disk (Day 22).
+
+    Returns:
+        SessionRecorder: call .start()/.stop() from session start/stop (see
+        create_session_controls()); connect wsl_connection's
+        transcript_received/suggestion_received to its record_transcript()/
+        record_suggestion() methods (see connect_session_recorder()).
+    """
+    return SessionRecorder()
+
+
+def connect_session_recorder(wsl_connection, session_recorder):
+    """
+    Wires wsl_app's incoming transcript/suggestion messages to
+    session_recorder, so they're saved to disk whenever a session is
+    actively being recorded. Kept connected for the app's whole lifetime,
+    same as connect_incoming_messages_to_ui() -- record_transcript()/
+    record_suggestion() are safe no-ops while no session is being recorded.
+    """
+    wsl_connection.transcript_received.connect(session_recorder.record_transcript)
+    wsl_connection.suggestion_received.connect(session_recorder.record_suggestion)
+
+
 def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window):
     """
     Creates the SuggestionDisplay that fans out one incoming suggestion to
@@ -1294,10 +1436,16 @@ def create_settings_panel(layout):
     no real choice left to expose, and wsl_app no longer reads a
     whisper_model_size setting at all.
 
+    Also includes the "Save this session's transcript to a file" checkbox
+    (Day 22, unchecked by default) that opts a session into local, on-disk
+    recording via SessionRecorder -- lives here, not its own group, since it
+    shares this panel's rule of being read once at Start Session rather than
+    live-toggleable mid-session, same as mode/pause/context notes.
+
     Returns:
-        tuple[QComboBox, QComboBox, QPlainTextEdit]: the mode and
-        suggestion pause dropdowns, plus the context notes text box, in
-        that order.
+        tuple[QComboBox, QComboBox, QPlainTextEdit, QCheckBox]: the mode
+        and suggestion pause dropdowns, the context notes text box, and the
+        save-transcript checkbox, in that order.
     """
     group = QGroupBox("Session Settings")
     form = QFormLayout(group)
@@ -1322,8 +1470,12 @@ def create_settings_panel(layout):
     context_notes_edit.setFixedHeight(80)
     form.addRow("Context notes:", context_notes_edit)
 
+    save_transcript_checkbox = QCheckBox("Save this session's transcript to a file")
+    save_transcript_checkbox.setChecked(False)
+    form.addRow(save_transcript_checkbox)
+
     layout.addWidget(group)
-    return mode_dropdown, pause_dropdown, context_notes_edit
+    return mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox
 
 
 def current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox):
@@ -1569,6 +1721,8 @@ def create_session_controls(
     pause_dropdown,
     context_notes_edit,
     auto_suggest_checkbox,
+    save_transcript_checkbox,
+    session_recorder,
     transcript_display,
     layout,
     window,
@@ -1581,12 +1735,16 @@ def create_session_controls(
     settings panel's current values (including the context notes and the
     auto-suggest checkbox's starting state) as settings_changed, then
     session_started (tagged with a fresh attempt_id — see
-    handle_session_start_failed), and starts capture on every manager in
+    handle_session_start_failed), starts capture on every manager in
     `capture_managers` (Day 19: one for mic, one for loopback — each is
     already its own independent capture thread, so starting/stopping both
-    here just means neither has to wait on the other); stopping sends
-    session_stopped and stops every manager. Button enabled-state tracks
-    which action is currently valid.
+    here just means neither has to wait on the other), and -- if
+    save_transcript_checkbox is checked -- starts session_recorder saving
+    this session to disk (Day 22) and shows RECORDING_WINDOW_TITLE so
+    that's visible for as long as it's on; stopping sends session_stopped,
+    stops every manager, stops session_recorder (a safe no-op if it was
+    never started), and restores the window title. Button enabled-state
+    tracks which action is currently valid.
 
     Also handles three ways a session can end itself, all reverting to the
     same clean pre-session UI state stop_session() reaches (see
@@ -1619,15 +1777,19 @@ def create_session_controls(
         stream failure — AudioCaptureManager.stop_capture() is a safe
         no-op on a manager that isn't currently capturing, so there's no
         need to track which manager, if any, already stopped.
+        session_recorder.stop() is likewise called unconditionally — a
+        safe no-op if this session was never being recorded.
         """
         if notify_wsl_app:
             wsl_connection.send_message({"type": "session_stopped"})
         for capture_manager in capture_managers:
             capture_manager.stop_capture()
+        session_recorder.stop()
+        window.setWindowTitle(DEFAULT_WINDOW_TITLE)
         revert_to_pre_session_state()
 
     def start_session():
-        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture on every source, and flips button state."""
+        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture on every source, starts session_recorder if the user opted in, and flips button state."""
         nonlocal current_attempt_id
         current_attempt_id += 1
         transcript_display.reset()
@@ -1637,6 +1799,9 @@ def create_session_controls(
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
         for capture_manager in capture_managers:
             capture_manager.start_capture()
+        if save_transcript_checkbox.isChecked():
+            session_recorder.start(mode_dropdown.currentText())
+            window.setWindowTitle(RECORDING_WINDOW_TITLE)
         start_button.setEnabled(False)
         stop_button.setEnabled(True)
 
@@ -1704,10 +1869,12 @@ def main():
     status label, each its own independent AudioCaptureManager; mic
     capture is skipped entirely, loopback-only, on a machine with no
     usable microphone -- see get_default_mic_device()), the
-    settings panel, the overlay opacity/click-through controls, the
-    auto-suggest toggle and manual trigger button, the session start/stop
-    controls, and the global suggestion-trigger and overlay show/hide
-    hotkeys, and runs the event loop until the main window is closed.
+    settings panel (including the opt-in "save transcript to a file"
+    checkbox -- Day 22, see SessionRecorder), the overlay opacity/
+    click-through controls, the auto-suggest toggle and manual trigger
+    button, the session start/stop controls, and the global
+    suggestion-trigger and overlay show/hide hotkeys, and runs the event
+    loop until the main window is closed.
 
     The main window's suggestion pane stays answer-only (Day 18): the
     overlay is the one place the question/answer excerpt pairing actually
@@ -1724,7 +1891,7 @@ def main():
     loopback_capture_status_label = create_capture_status_label(layout)
     mic_device_dropdown = create_device_dropdown(layout, "Microphone device (your own voice, i.e. \"You\"):")
     mic_capture_status_label = create_capture_status_label(layout)
-    mode_dropdown, pause_dropdown, context_notes_edit = create_settings_panel(layout)
+    mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox = create_settings_panel(layout)
     overlay_window = create_overlay_window()
     create_overlay_controls(layout, overlay_window)
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
@@ -1732,6 +1899,7 @@ def main():
     transcript_display = create_transcript_display(transcript_pane)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
     suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
+    session_recorder = create_session_recorder()
 
     audio = pyaudio.PyAudio()
     loopback_devices = list_loopback_devices(audio)
@@ -1751,6 +1919,7 @@ def main():
 
     wsl_connection = start_wsl_connection(status_label)
     connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display)
+    connect_session_recorder(wsl_connection, session_recorder)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     loopback_capture_manager = create_audio_capture_manager(
         audio, wsl_connection, AUDIO_SOURCE_LOOPBACK, loopback_device_dropdown, default_loopback_device,
@@ -1769,6 +1938,8 @@ def main():
         pause_dropdown,
         context_notes_edit,
         auto_suggest_checkbox,
+        save_transcript_checkbox,
+        session_recorder,
         transcript_display,
         layout,
         window,
