@@ -71,17 +71,35 @@ MIC_SPEECH_DETECTION_STRICTNESS = 3
 SILENCE_SECONDS_TO_CLOSE_SEGMENT = 0.4
 
 # Safety net: force-close a segment after this long even without a pause,
-# so one uninterrupted run-on sentence can't grow the buffer forever.
-# Raised from the original 20.0 (Day 18, user-reported live): a real
+# so one uninterrupted run-on sentence can't grow the buffer forever --
+# and, since Day 21, the main lever for how long a fast talker's speech
+# sits transcribed-but-unshown before anything appears on screen at all.
+#
+# Originally 20.0, raised to 60.0 on Day 18 (user-reported live): a real
 # interview answer routinely runs past 20s of continuous explanation
-# without a pause long enough to close a segment naturally -- confirmed
-# live, the 20s cap force-split mid-word ("Can you explain H2..." /
-# "to be cashing." as the orphaned, context-less remainder), which both
-# looks wrong on the transcript and measurably hurts accuracy on whichever
-# half loses its surrounding context. 60s comfortably covers a full
-# uninterrupted technical walkthrough while still bounding worst-case
-# buffered-audio growth to something reasonable for a local dev tool.
-MAX_SEGMENT_SECONDS = 60.0
+# without a pause long enough to close a segment naturally, and forcing a
+# close that early split words mid-sentence ("Can you explain H2..." /
+# "to be cashing." as the orphaned, context-less remainder) -- both
+# visibly wrong on the transcript and measurably worse accuracy on
+# whichever half lost its surrounding context.
+#
+# Lowered again here (Day 21) on the strength of Day 20's benchmark
+# (research/day20/README.md, Track A): the accuracy loss above wasn't
+# actually caused by the short cut itself -- it was
+# NO_SPEECH_PROBABILITY_THRESHOLD spuriously dropping real, clearly-spoken
+# audio because a forced mid-sentence boundary reads as "no speech" almost
+# as strongly as true silence does. With that filter skipped specifically
+# for forced closes (see ClosedSegment.closed_on_forced_timeout and
+# transcribe_segment() below), Day 20 verified an 8-12s threshold back to
+# near-baseline WER (7.2%/6.0% vs. the old 60s cap's own 6.8%, on the same
+# clip that originally motivated raising this to 60) while cutting
+# time-to-first-visible-text for one long unbroken sentence by roughly
+# 80% (measured ~50s down to ~8-11s). 10.0 splits that verified 8-12s
+# range. One residual risk Day 20 did not fully close: a mid-sentence cut
+# can still occasionally make Whisper fabricate a short clause rather than
+# drop content -- rarer and milder than the whole-segment drops this fix
+# targets, not eliminated by it.
+MAX_SEGMENT_SECONDS = 10.0
 
 # Segments shorter than this are almost always a false positive from the
 # speech detector (a brief noise blip, not real speech), so skip the
@@ -365,10 +383,18 @@ class ClosedSegment(NamedTuple):
     this, since two segments of different length or two pipelines under
     different CPU load can finish in a different order than they were
     actually spoken in.
+
+    closed_on_forced_timeout tells transcribe_segment() whether this
+    segment ended because someone actually paused (a real sentence
+    boundary) or because MAX_SEGMENT_SECONDS was reached mid-speech (see
+    that constant's docstring) -- the two cases need different
+    hallucination-filtering treatment, since a forced boundary has no
+    natural pause for NO_SPEECH_PROBABILITY_THRESHOLD to key off of.
     """
 
     audio_bytes: bytes
     started_at: float
+    closed_on_forced_timeout: bool
 
 
 class VoiceSegmenter:
@@ -464,21 +490,23 @@ class VoiceSegmenter:
         else:
             self._seconds_of_silence_in_a_row += FRAME_DURATION_SECONDS
             if self._seconds_of_silence_in_a_row >= SILENCE_SECONDS_TO_CLOSE_SEGMENT:
-                return self._close_current_segment()
+                return self._close_current_segment(closed_on_forced_timeout=False)
 
         if self._seconds_recorded_in_current_segment >= MAX_SEGMENT_SECONDS:
-            return self._close_current_segment()
+            return self._close_current_segment(closed_on_forced_timeout=True)
 
         return None
 
-    def _close_current_segment(self):
+    def _close_current_segment(self, closed_on_forced_timeout):
         """
         Packages up everything recorded for the current segment so it can
         be handed off for transcription, then resets so the next speech
         heard starts a brand new segment.
 
         Returns:
-            ClosedSegment: the finished segment's audio and start time.
+            ClosedSegment: the finished segment's audio, start time, and
+            whether it closed via MAX_SEGMENT_SECONDS rather than a real
+            pause (see ClosedSegment's docstring).
         """
         finished_segment_audio = bytes(self._current_segment_audio)
         started_at = self._segment_started_at
@@ -487,14 +515,19 @@ class VoiceSegmenter:
         self._segment_started_at = None
         self._seconds_of_silence_in_a_row = 0.0
         self._seconds_recorded_in_current_segment = 0.0
-        return ClosedSegment(finished_segment_audio, started_at)
+        return ClosedSegment(finished_segment_audio, started_at, closed_on_forced_timeout)
 
     def close_open_segment(self):
         """
         Force-closes whatever segment is currently in progress, if any.
         Used when a session stops, so audio that hasn't hit a silence gap
         yet (someone stops the session right after finishing a sentence)
-        isn't silently dropped.
+        isn't silently dropped. Reported as closed_on_forced_timeout=False
+        even though nothing paused -- this is a session-ending flush, not
+        a mid-run-on-sentence cut, so it's the same "trailing audio, maybe
+        real silence" shape NO_SPEECH_PROBABILITY_THRESHOLD was actually
+        tuned for (see that constant's docstring), not the forced-boundary
+        false-positive case MAX_SEGMENT_SECONDS's cut needs to skip it for.
 
         Returns:
             ClosedSegment | None: the finished segment, or None if nothing
@@ -502,7 +535,7 @@ class VoiceSegmenter:
         """
         if not self._segment_is_open:
             return None
-        return self._close_current_segment()
+        return self._close_current_segment(closed_on_forced_timeout=False)
 
 
 def segment_duration_seconds(audio_bytes):
@@ -514,7 +547,7 @@ def segment_duration_seconds(audio_bytes):
     return len(audio_bytes) / 2 / TARGET_SAMPLE_RATE
 
 
-def transcribe_segment(model, audio_bytes):
+def transcribe_segment(model, audio_bytes, closed_on_forced_timeout):
     """
     Runs Whisper on one closed speech segment. This is blocking, CPU-bound
     work — always call it through asyncio.to_thread(), never directly on
@@ -523,16 +556,24 @@ def transcribe_segment(model, audio_bytes):
     silence or noise (a webrtcvad false positive, or a stretch of near-
     silence caught up in the same segment as real speech) can't have
     Whisper hallucinate a stock phrase into the transcript.
+    `closed_on_forced_timeout` skips transcribe_filtered's
+    NO_SPEECH_PROBABILITY_THRESHOLD check for a segment that closed via
+    MAX_SEGMENT_SECONDS rather than a real pause -- see that constant's
+    docstring for why a forced mid-sentence boundary needs this.
 
     Returns:
         str: the transcribed text, stripped of leading/trailing whitespace.
     """
     audio = prepare_audio_for_whisper(audio_bytes)
-    words = transcribe_filtered(model, audio, TRANSCRIBE_BEAM_SIZE)
+    words = transcribe_filtered(
+        model, audio, TRANSCRIBE_BEAM_SIZE, skip_no_speech_filter=closed_on_forced_timeout
+    )
     return "".join(word[2] for word in words).strip()
 
 
-async def transcribe_segment_and_report(model, transcribe_lock, writer, audio_bytes, source, started_at, session=None):
+async def transcribe_segment_and_report(
+    model, transcribe_lock, writer, audio_bytes, source, started_at, closed_on_forced_timeout, session=None
+):
     """
     Transcribes one closed speech segment in a background thread (keeping
     the event loop free to keep reading incoming messages), logs the
@@ -551,12 +592,14 @@ async def transcribe_segment_and_report(model, transcribe_lock, writer, audio_by
     around the actual transcribe call, so segments still queue up and wait
     their turn instead of fighting each other for CPU -- the logged
     "Xs to transcribe" duration includes any time spent waiting for the
-    lock, which is real, user-facing latency either way.
+    lock, which is real, user-facing latency either way. `closed_on_forced_
+    timeout` is passed straight through to transcribe_segment() -- see its
+    docstring.
     """
     duration_seconds = segment_duration_seconds(audio_bytes)
     transcribe_started_at = time.monotonic()
     async with transcribe_lock:
-        text = await asyncio.to_thread(transcribe_segment, model, audio_bytes)
+        text = await asyncio.to_thread(transcribe_segment, model, audio_bytes, closed_on_forced_timeout)
     elapsed_seconds = time.monotonic() - transcribe_started_at
     timestamp = time.strftime("%H:%M:%S")
     spoken_text = text if text else "(no speech detected)"
@@ -586,7 +629,14 @@ def handle_finished_segment(model, transcribe_lock, writer, closed_segment, sour
         return
     asyncio.create_task(
         transcribe_segment_and_report(
-            model, transcribe_lock, writer, closed_segment.audio_bytes, source, closed_segment.started_at, session
+            model,
+            transcribe_lock,
+            writer,
+            closed_segment.audio_bytes,
+            source,
+            closed_segment.started_at,
+            closed_segment.closed_on_forced_timeout,
+            session,
         )
     )
 
@@ -638,7 +688,7 @@ def default_settings():
         "mode": DEFAULT_MODE,
         "suggestion_pause_seconds": PAUSE_SECONDS_BEFORE_SUGGESTION,
         "context_notes": "",
-        "auto_suggest_enabled": True,
+        "auto_suggest_enabled": False,
     }
 
 
@@ -765,7 +815,7 @@ async def handle_client(model_manager, reader, writer):
                 pending_settings = settings_from_message(message)
             elif message_type == "auto_suggest_changed":
                 if session is not None:
-                    session.set_auto_suggest_enabled(bool(message.get("enabled", True)))
+                    session.set_auto_suggest_enabled(bool(message.get("enabled", False)))
             else:
                 reply = await build_reply(message)
                 if reply is not None:
@@ -1194,7 +1244,7 @@ class SuggestionTrigger:
     hotkey/button path always works, on or off.
     """
 
-    def __init__(self, generate_suggestion, pause_seconds, auto_suggest_enabled=True):
+    def __init__(self, generate_suggestion, pause_seconds, auto_suggest_enabled=False):
         """
         Stores the async function to call when the trigger fires, and how
         long the pause timer (step 2 above) should wait. Starts idle: no
@@ -1281,7 +1331,7 @@ class MeetingSession:
     doesn't lose the transcript context built up so far.
     """
 
-    def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=True):
+    def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=False):
         """
         Starts a fresh session using the settings captured for it at
         session_started (see handle_client): a fresh VoiceSegmenter per

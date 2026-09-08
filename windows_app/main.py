@@ -1254,14 +1254,16 @@ def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_windo
 
 def create_suggestion_trigger_controls(layout):
     """
-    Adds a row with the "Auto-suggest on pause" checkbox (checked by
-    default, matching today's pre-Phase-1.5 behavior) and a "Generate
-    Suggestion Now" button. Unlike the settings panel above, the checkbox
-    is meant to be flipped live during a running session — see
-    create_session_controls() and wsl_app's SuggestionTrigger — so it lives
-    outside "Session Settings" rather than inside it. The button gives
-    manual triggering an in-window equivalent of the global hotkey, for
-    anyone who'd rather click than reach for a key combination.
+    Adds a row with the "Auto-suggest on pause" checkbox (unchecked by
+    default — Phase 3, user preference: suggestions should only appear when
+    asked for, via this checkbox or the manual button/hotkey, not fire on
+    every pause unless the user opts in) and a "Generate Suggestion Now"
+    button. Unlike the settings panel above, the checkbox is meant to be
+    flipped live during a running session — see create_session_controls()
+    and wsl_app's SuggestionTrigger — so it lives outside "Session Settings"
+    rather than inside it. The button gives manual triggering an in-window
+    equivalent of the global hotkey, for anyone who'd rather click than
+    reach for a key combination.
 
     Returns:
         tuple[QCheckBox, QPushButton]: the auto-suggest checkbox and the
@@ -1269,7 +1271,7 @@ def create_suggestion_trigger_controls(layout):
     """
     row = QHBoxLayout()
     auto_suggest_checkbox = QCheckBox("Auto-suggest on pause")
-    auto_suggest_checkbox.setChecked(True)
+    auto_suggest_checkbox.setChecked(False)
     generate_button = QPushButton("Generate Suggestion Now")
     row.addWidget(auto_suggest_checkbox)
     row.addWidget(generate_button)

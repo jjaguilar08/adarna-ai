@@ -34,6 +34,19 @@ MAX_HALLUCINATED_REPEAT_PHRASE_WORDS = 8
 # live, Day 18: stopping a real mock-interview session mid-sentence
 # consistently appended a hallucinated "Thank you for watching and see you
 # next time" to the transcript.
+#
+# Day 20 found this threshold has a real false-positive class of its own,
+# unrelated to genuine silence: a forced (non-pause) segment boundary --
+# a mid-sentence cut with no natural pause at either edge -- reads as
+# "probably no speech" almost as strongly as true silence does, because
+# the score reacts to the audio having no natural utterance boundary at
+# its edges, not just to the audio's actual content. On real, clearly-
+# spoken audio this dropped an entire correctly-transcribable clause
+# (no_speech_prob 0.799, comfortably above 0.6). See transcribe_filtered's
+# skip_no_speech_filter parameter, used by wsl_app/main.py to skip this
+# specific check for forced-close segments only -- AVG_LOGPROB_THRESHOLD
+# and SILENCE_AMPLITUDE_THRESHOLD below still apply unconditionally, since
+# neither was the culprit and both still catch genuine hallucination.
 NO_SPEECH_PROBABILITY_THRESHOLD = 0.6
 
 # Below this, a segment is dropped outright regardless of its no_speech_prob
@@ -123,7 +136,7 @@ def drop_immediate_repeated_phrase(words, max_phrase_words=MAX_HALLUCINATED_REPE
     return result
 
 
-def transcribe_filtered(model, audio, beam_size, initial_prompt=None):
+def transcribe_filtered(model, audio, beam_size, initial_prompt=None, skip_no_speech_filter=False):
     """
     Runs one model.transcribe() call and returns only the words Whisper
     itself seems confident are real speech -- every hallucination defense
@@ -131,6 +144,14 @@ def transcribe_filtered(model, audio, beam_size, initial_prompt=None):
     THRESHOLD, AVG_LOGPROB_THRESHOLD, drop_immediate_repeated_phrase)
     applied in one place. Use this instead of calling model.transcribe()
     directly anywhere in this app.
+
+    `skip_no_speech_filter` leaves NO_SPEECH_PROBABILITY_THRESHOLD out of
+    the check entirely -- see that constant's docstring for why: it's a
+    real false-positive risk specifically on a forced (non-pause) segment
+    boundary, which has no natural utterance boundary for the model to key
+    off of. AVG_LOGPROB_THRESHOLD and the SILENCE_AMPLITUDE_THRESHOLD gate
+    above still apply either way, since neither is the source of that
+    false-positive and both still catch genuine hallucination.
 
     Returns:
         list[(start, end, text)]: filtered words, timed relative to the
@@ -151,7 +172,9 @@ def transcribe_filtered(model, audio, beam_size, initial_prompt=None):
     )
     words = []
     for segment in segments:
-        if segment.no_speech_prob > NO_SPEECH_PROBABILITY_THRESHOLD or segment.avg_logprob < AVG_LOGPROB_THRESHOLD:
+        if not skip_no_speech_filter and segment.no_speech_prob > NO_SPEECH_PROBABILITY_THRESHOLD:
+            continue
+        if segment.avg_logprob < AVG_LOGPROB_THRESHOLD:
             continue
         if segment.words:
             for word in segment.words:
