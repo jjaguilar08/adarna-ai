@@ -633,6 +633,51 @@ but none exists yet in the repo and this research session had no way to record o
 class of gap as every prior real-physical-action item in this project) — provisional until a real
 recording is tested, but not a reason to adopt WhisperX on what was actually measured here.
 
+## Day 21 — Rolling Transcript: Implementation (fast-speech-aware segmentation + boundary-safe fix) ✅ implemented — live mic/loopback verification still open
+
+Actual outcomes: both pieces landed together in `wsl_app/main.py`/`streaming_transcriber.py`, ported
+from the verified `research/day20/track_a_boundary_safe_fix.py` logic as real production code (real
+docstrings, plain naming) rather than copy-pasted research-script style. `MAX_SEGMENT_SECONDS` lowered
+60.0→10.0 (the midpoint of Day 20's verified 8-12s range), with the comment rewritten to explain both
+why Day 18 raised it *and* why Day 20's fix makes lowering it safe again. `ClosedSegment` gained
+`closed_on_forced_timeout: bool`, set explicitly (not inferred from timing) at each of its three close
+sites in `VoiceSegmenter` — `True` only for the `MAX_SEGMENT_SECONDS` path, `False` for a real pause
+close and for the session-stop flush. `transcribe_filtered()` gained `skip_no_speech_filter`, threaded
+through `transcribe_segment()` → `transcribe_segment_and_report()` → `handle_finished_segment()`;
+`AVG_LOGPROB_THRESHOLD`/`SILENCE_AMPLITUDE_THRESHOLD` stay active unconditionally.
+
+Verified two ways: unit-level (`VoiceSegmenter` reports the right flag on all three close paths, and
+it threads correctly into `skip_no_speech_filter`), and by running the actual production code (not a
+reimplementation) against Day 20's four TTS benchmark clips with the real `small.en` model — `fast_long`
+(the run-on-sentence stress case) reached 14.3s time-to-first-text at 6.8% WER, matching the old 60s
+baseline with no severe content loss, reproducing Day 20's numbers through the real wiring. One real
+finding surfaced during this: `en_normal` picked up a "Thank you for watching" hallucination at the new
+threshold that doesn't occur at 60s. Traced it directly — it happened on a segment that closed via a
+**real pause**, not a forced timeout, so the new filter skip wasn't even in play; a control run at the
+old 60s threshold confirmed the same clip doesn't hallucinate there. Root cause: shifting segment
+boundaries at the shorter threshold can occasionally isolate a short trailing-breath fragment as its
+own ambiguous segment, hitting the pre-existing "short/ambiguous segment" hallucination class this
+project already knew about (Day 18's ultra-short-tail garbled-artifact note) rather than a new failure
+mode — just newly exposed by more frequent forced boundaries. Not fixed (matches the residual-risk
+framing already carried into this day's scope below), but worth knowing about going in.
+
+**Still open, not yet confirmed:** live verification against real mic/loopback speech during a real
+session — everything above is TTS (matching Day 20's own test set) plus unit tests, not a substitute
+for the real thing. This needs the real `windows_app` audio capture path, which requires actual
+Windows and can't be driven by this WSL-based session — same class of gap as this project's prior
+hotkey/drag-test items. Do this at the first opportunity with a real running session: speak one
+genuinely unbroken 20-30s+ sentence and confirm text appears in ~10s chunks (not waiting for a full
+60s-equivalent pause) with no dropped or fabricated content versus the prior behavior.
+
+Also folded into this session, ad hoc, not part of the original scope below: the "Auto-suggest on
+pause" checkbox now defaults to unchecked (`windows_app/main.py`), kept in sync everywhere the old
+`True` default appeared in `wsl_app/main.py` (`default_settings()`, `SuggestionTrigger.__init__`,
+`MeetingSession.__init__`, and the `auto_suggest_changed` handler's defensive fallback) — a session
+now starts with suggestions off until explicitly asked for. Committed together as `403b8cb`, no
+co-author trailer per standing instruction (see `MEMORY.md`).
+
+<details><summary>Original Day 21 scope (for reference)</summary>
+
 ## Day 21 — Rolling Transcript: Implementation (fast-speech-aware segmentation + boundary-safe fix)
 
 Added 2026-09-07, scoped directly from Day 20's Track A recommendation — implementation, not
@@ -689,9 +734,53 @@ shows transcript text appearing well before the old 60s cap would have, and a si
 against the prior whole-segment behavior on that same real speech shows no observable content loss
 or fabrication introduced by the shorter threshold.
 
+</details>
+
 ## Day 22 — Opt-in Session Persistence (Phase 2, part 3)
 
-- Explicit, off-by-default setting to save transcript + suggestions from a session to a local file.
-- Off unless turned on, per PRD §5/§9's privacy stance — no behavior change for anyone who leaves it alone.
+Scope per PRD §5/§9's privacy stance (RA 4200 anti-wiretapping consent law is the underlying reason):
+off by default, transcript + suggestions only — **never raw audio**, that stays exclusively in-memory
+regardless of this setting. No behavior change at all for anyone who leaves the setting alone.
 
-**Done when:** with persistence off (default), nothing is written to disk, exactly as today; with it explicitly turned on, a real session's transcript and suggestions are saved locally and can be found/opened afterward.
+**Design call, made here rather than left open:** implement this entirely on the `windows_app` side,
+not `wsl_app`. `windows_app` already receives every `transcript` and `suggestion` message over the
+existing socket protocol as they're generated — nothing needs to change in `wsl_app` or the wire
+protocol to make the data available; this is purely "also write what's already arriving to a local
+file." Keeping it Windows-side also means the saved file lands somewhere the user would actually look
+for it (Windows Explorer), not buried in the WSL filesystem.
+
+- New checkbox in `windows_app`'s settings panel (`create_settings_panel()`, alongside the existing
+  mode/pause-delay/context-notes controls) — something like "Save this session's transcript to a
+  file," unchecked by default. Read once at Start Session, same as mode/pause_seconds/context_notes
+  (not live-toggleable mid-session — starting to persist partway through a session is a separate,
+  more complex feature not asked for here).
+- On Start Session, if checked: open a new local file for this session (e.g. under a
+  `windows_app/sessions/` folder, filename including a timestamp so back-to-back sessions never
+  collide) and write a small header (start time, mode). As `transcript` and `suggestion` messages
+  arrive during the session (today these already reach `TranscriptDisplay.update()` and
+  `SuggestionDisplay.update()` via `wsl_connection.transcript_received`/`suggestion_received`, wired
+  up in `connect_incoming_messages_to_ui()`), also append each one to the open file, in real time
+  rather than buffering everything to write at the end — a crash or force-quit mid-session shouldn't
+  lose an otherwise-complete transcript.
+- On Stop Session (and on disconnect/session-end via whatever path already tears a session down),
+  close the file cleanly if one is open.
+- Plain text is enough — no need for a structured format (JSON/markdown) unless it's genuinely no
+  extra effort. A readable chronological log (source-labeled transcript lines interleaved with
+  suggestions in the order they actually happened, timestamps included) is the goal; don't
+  over-engineer the format for a feature whose whole point is "so I can glance back at it later."
+- Add the new `sessions/` folder to `.gitignore` (real transcript content must never end up
+  committed) — check whether `windows_app/` already has one or if it needs adding at the repo root.
+- Worth a visible-while-active indicator that a session is being saved (e.g. something in the window
+  title or near the checkbox, "Saving to <filename>") — the whole feature exists for a consent/privacy
+  reason, so it shouldn't be silently invisible once turned on. Not a hard requirement of "done when"
+  below, but keep it in mind; a small addition if it doesn't cost much.
+
+**Live verification required, not just a read-through** — per this project's own established rule.
+Run a real session with the setting off and confirm nothing new appears on disk; run one with it on,
+speak/generate a few real transcript lines and at least one suggestion, stop the session, and actually
+open the resulting file to confirm it's complete and readable — not just that a file got created.
+
+**Done when:** with persistence off (default), nothing is written to disk, exactly as today; with it
+explicitly turned on for a real session, that session's transcript and suggestions are saved locally
+in a file that can be found and opened afterward, and reads as a complete, readable record of what
+actually happened.
