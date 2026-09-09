@@ -15,10 +15,15 @@ no degradation. This is the real production wiring for that mechanism.
 
 ## What this is — and isn't
 
-- **Is**: an opt-in log `wsl_app` writes in real time during a session, purpose-built to be
-  `tail -f`'d by a second interactive `claude` session.
+- **Is**: an opt-in log `wsl_app` writes in real time during a session, at a single fixed path
+  (`wsl_app/live_agent_logs/live_agent_current.log`, overwritten fresh each session — not a unique
+  file per session, deliberately, so a launcher script can point at it without you copying a path
+  out of a console every time), purpose-built to be `tail -F`'d by a second interactive `claude`
+  session.
 - **Isn't**: a button that "just works" inside `windows_app`. It requires a second, manually-started,
-  human-attended terminal per meeting — the same operational model Day 18.8 confirmed.
+  human-attended terminal per meeting — the same operational model Day 18.8 confirmed. What used to
+  be several manual sub-steps (start `claude`, tell it to tail and monitor, paste it instructions)
+  is now one command — see below — but that second terminal itself still isn't optional.
 - **Isn't**: routed into `windows_app`'s overlay or transcript pane. The live agent's real answers
   show up only in its own terminal. Routing them back into the GUI was considered and deliberately
   not built — it would add a new hop and work against this mode's whole appeal.
@@ -34,33 +39,26 @@ no degradation. This is the real production wiring for that mechanism.
 ## Step by step
 
 1. Check "Enable live-agent-listening export", then press Start Session as usual.
-2. Look at `wsl_app`'s own console output. Once the session starts, it prints a line like:
+2. In a second WSL terminal, from this repo's root:
    ```
-   Live-agent-listening log: /home/jon/projects/adarna-ai/wsl_app/live_agent_logs/live_agent_2026-09-09_143210.log
+   ./start_live_agent_listening.sh
    ```
-   Copy that path.
-3. Open a second terminal and start an ordinary interactive `claude` session in this project
-   (`cd /home/jon/projects/adarna-ai && claude`). If you're not going to be at the keyboard to approve
-   tool calls during the meeting, start it with `--permission-mode bypassPermissions` instead — the
-   same setup detail Day 18.9's real unattended run needed, not a finding about the mechanism itself.
-4. Give it a background task tailing the log, and attach the Monitor tool to it — the exact pattern
-   Day 18.9/18.10 already proved works, e.g.: "run `tail -f <the path from step 2>` in the background
-   and monitor it."
-5. Paste it these operating instructions (there's no `--system-prompt` flag for an interactive
-   session the way `wsl_app`'s own `ClaudeCli` sets one, so this has to be typed/pasted by you):
+   That's it — no path to copy, nothing to type into the session afterward. The script starts an
+   interactive `claude` session (`--permission-mode bypassPermissions`, needed since nobody's there
+   to answer approval prompts during a real meeting — see the script's own comment) with
+   `docs/live_agent_listening_prompt.txt` as its opening prompt. That prompt tells it, as its very
+   first action, to background a `tail -F` of the fixed log path and attach Monitor, then just watch
+   — see that file for the exact operating instructions (how it should react to `SEGMENT`/`TRIGGER`
+   lines, the answer shape per mode) if you ever want to tweak them.
+3. Run the meeting. Glance at this second terminal whenever you want the live agent's take.
+4. When the meeting ends: Stop Session in `windows_app` closes the log file (with a footer line);
+   stop the `claude` session in the second terminal (Ctrl+C, or however you'd normally end one)
+   whenever you're done with it.
 
-   > You'll receive lines from a live meeting transcript as background notifications. The header line
-   > tells you the mode (`meeting` or `interview`) and any context notes — use them the same way
-   > `MEETING_SYSTEM_PROMPT`/`INTERVIEW_SYSTEM_PROMPT` in `wsl_app/main.py` do. Each `SEGMENT` line is
-   > one thing someone said, labeled `You:` or `Them:` — just note it silently, don't respond to it.
-   > Only when a `TRIGGER` line arrives, produce one real answer for what the user (`You`) could say
-   > next, in the same plain-text lead-plus-bullets shape `RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION`/
-   > `INTERVIEW_RESPOND_INSTRUCTION` use for the mode in the header — grounded in everything
-   > accumulated in this conversation so far, not just the most recent segment.
-
-6. Run the meeting. Glance at this second terminal whenever you want the live agent's take.
-7. When the meeting ends: Stop Session in `windows_app` closes the log file (with a footer line); stop
-   the `tail -f` background task yourself in the second terminal whenever you're done with it.
+If you'd rather drive it manually instead of the script (e.g. to watch it start up, or to tweak
+something for one run without editing the prompt file): open a second terminal, `cd` into this repo,
+start `claude --permission-mode bypassPermissions`, then paste in the contents of
+`docs/live_agent_listening_prompt.txt` yourself.
 
 ## Important caveat
 
@@ -90,9 +88,15 @@ unless you explicitly check the box before starting a session, and the log direc
 
 ## Troubleshooting
 
-- **No file appears / no path printed**: the checkbox wasn't checked before Start Session, or the
-  session failed to start at all (check for a `session_start_failed` message / error dialog).
+- **`start_live_agent_listening.sh`'s `tail -F` seems stuck waiting**: the checkbox wasn't checked
+  before Start Session, or the session failed to start at all (check `wsl_app`'s own console for a
+  "Live-agent-listening log: ..." line, or `windows_app` for a `session_start_failed` error dialog)
+  — `tail -F` will just keep retrying until the file actually appears, rather than erroring.
 - **`SEGMENT` lines but no `TRIGGER` lines**: see "Important caveat" above — auto-suggest is off and
   the hotkey was never pressed.
+- **The log still has last session's content in it when you expected a fresh one**: `start()` opens
+  and truncates `live_agent_current.log` fresh at the top of every session it's enabled for — if
+  you're seeing stale content, the checkbox likely wasn't actually checked for the session you just
+  ran (see the first bullet above).
 - **`wsl_app/live_agent_logs/` directory missing**: it's created lazily on the first session that
   actually enables the export — nothing to do, it'll appear.

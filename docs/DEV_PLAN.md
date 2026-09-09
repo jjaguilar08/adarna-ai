@@ -1014,3 +1014,30 @@ way Day 18.8-18.10 proved for synthetic audio.
 a separately-started interactive `claude` session, following docs/LIVE_AGENT_LISTENING.md, tails it and
 reacts to real `SEGMENT`/`TRIGGER` lines with no manual intervention during the meeting; and its
 answers are genuinely useful, not just mechanically present.
+
+**Update, 2026-09-09 (later same day) — the manual second-terminal setup automated down to one
+command.** Jon flagged the original step-by-step (start `claude`, tell it to background a `tail -f`
+of a console-printed path and attach Monitor, then paste it a paragraph of operating instructions)
+as tedious. Fixed:
+- `LIVE_AGENT_LOG_PATH`: the log is now a single fixed filename
+  (`wsl_app/live_agent_logs/live_agent_current.log`, truncated and overwritten fresh each session)
+  instead of one generated per session — a deliberate trade confirmed with Jon (losing a
+  session-by-session history of past logs, which this live-tail-only feature never actually needed;
+  `SessionRecorder`, Day 22, already covers "keep a record for later"), in exchange for a path a
+  script can hardcode instead of a human copying a fresh one out of `wsl_app`'s console every time.
+- New `start_live_agent_listening.sh` (repo root, mirrors `start_app.sh`'s style/doc-comment
+  convention): one command, run in the second terminal, that starts
+  `claude --permission-mode bypassPermissions` with `docs/live_agent_listening_prompt.txt` as its
+  opening prompt.
+- New `docs/live_agent_listening_prompt.txt`: the operating instructions (background a `tail -F`
+  --capital F, so it retries if the session hasn't started writing the file yet-- of the fixed log
+  path, attach Monitor, then the same SEGMENT/TRIGGER reaction rules docs/LIVE_AGENT_LISTENING.md
+  already documented) as its own file, so the launcher script and a manual fallback both stay in
+  sync with one source of truth instead of two copies of the same text drifting apart.
+- `docs/LIVE_AGENT_LISTENING.md` updated: the 5-step manual dance is now "run one script," with the
+  old manual sequence kept as an explicit fallback for anyone who'd rather drive it by hand.
+
+Verified statically: `claude --help` confirms `--permission-mode bypassPermissions` and the
+`claude [options] [prompt]` positional-argument shape the script relies on are both real, current
+CLI flags — not just assumed from Day 18.9's own precedent. Not re-run against a real meeting yet;
+the "needs Jon's own hands" item above is unchanged, just less tedious to actually go do now.

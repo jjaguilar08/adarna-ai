@@ -25,13 +25,23 @@ from streaming_transcriber import TARGET_SAMPLE_RATE, prepare_audio_for_whisper,
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 STATS_WINDOW_SECONDS = 1.0
 
-# Where opt-in live-agent-listening export logs (see LiveAgentLog) are
+# Where the opt-in live-agent-listening export log (see LiveAgentLog) is
 # saved -- kept in wsl_app's own filesystem, not windows_app's (contrast
 # with Day 22's SessionRecorder, which is deliberately Windows-side for
 # Explorer visibility) -- the whole point of this file is to be `tail -f`'d
 # by a separate `claude` terminal session run from WSL, so keeping it in
 # WSL's filesystem avoids any cross-boundary path awkwardness for that.
+#
+# LIVE_AGENT_LOG_PATH is a single fixed filename, not one generated fresh
+# per session (each start() truncates and rewrites it) -- deliberately, so
+# start_live_agent_listening.sh can point a tail at a path known in advance
+# rather than the operator having to copy a new timestamped path out of
+# wsl_app's console every session. This log is a live feed meant to be
+# actively tailed, not a record reviewed afterward (SessionRecorder, Day
+# 22, already covers that need), so there's no real loss in not keeping
+# every past session's copy around.
 LIVE_AGENT_LOG_DIR = Path(__file__).resolve().parent / "live_agent_logs"
+LIVE_AGENT_LOG_PATH = LIVE_AGENT_LOG_DIR / "live_agent_current.log"
 
 # asyncio's StreamReader defaults to a 64KiB limit on how long one
 # newline-delimited message line can be before readline() gives up and
@@ -1272,19 +1282,22 @@ class ClaudeCli:
 class LiveAgentLog:
     """
     Writes an opt-in, plain-text, real-time-flushed log of one session's
-    transcript segments and real suggestion-trigger moments to a local file
-    under LIVE_AGENT_LOG_DIR -- the data feed for "live-agent-listening"
-    (see docs/LIVE_AGENT_LISTENING.md): a separate, manually-started
-    interactive `claude` terminal session, `tail -f`-ing this file via a
-    background Bash task and Monitor (the same mechanism proven in
-    docs/DEV_PLAN.md's Day 18.8-18.10), can react to SEGMENT lines as cheap
-    background notifications and produce one real, grounded answer whenever
-    a TRIGGER line arrives -- with near-zero latency at that point, since
-    the conversation is already live in that agent's own context rather
-    than reconstructed per call the way ClaudeCli's one-shot suggestions
-    are. Off by default and no behavior change at all unless the user opts
-    in -- same consent stance as SessionRecorder (windows_app/main.py, Day
-    22): this also continuously writes real conversation content to disk.
+    transcript segments and real suggestion-trigger moments to LIVE_AGENT_LOG_PATH
+    -- a single fixed file, not one generated fresh per session (see that
+    constant's own comment) -- the data feed for "live-agent-listening"
+    (see docs/LIVE_AGENT_LISTENING.md): a separate `claude` terminal
+    session, `tail -f`-ing this file via a background Bash task and
+    Monitor (the same mechanism proven in docs/DEV_PLAN.md's Day
+    18.8-18.10, now startable with one command -- see
+    start_live_agent_listening.sh), can react to SEGMENT lines as cheap
+    background notifications and produce one real, grounded answer
+    whenever a TRIGGER line arrives -- with near-zero latency at that
+    point, since the conversation is already live in that agent's own
+    context rather than reconstructed per call the way ClaudeCli's
+    one-shot suggestions are. Off by default and no behavior change at all
+    unless the user opts in -- same consent stance as SessionRecorder
+    (windows_app/main.py, Day 22): this also continuously writes real
+    conversation content to disk.
 
     Deliberately NOT the same file as SessionRecorder's session recording:
     that file has no "decide now" signal in it (a TRIGGER moment there is
@@ -1302,8 +1315,10 @@ class LiveAgentLog:
 
     def start(self, mode, context_notes, auto_suggest_enabled, pause_seconds):
         """
-        Opens a new timestamped file under LIVE_AGENT_LOG_DIR and writes its
-        header: start time, mode, and the auto_suggest/pause_seconds
+        Opens LIVE_AGENT_LOG_PATH -- truncating and overwriting whatever an
+        earlier session may have left there, since it's a single fixed
+        filename (see that constant's own comment for why) -- and writes
+        its header: start time, mode, and the auto_suggest/pause_seconds
         settings that govern whether and how often TRIGGER lines can
         actually appear (see class docstring -- TRIGGER lines are entirely
         piggybacked on the existing SuggestionTrigger, there's no
@@ -1313,13 +1328,13 @@ class LiveAgentLog:
         MEETING_SYSTEM_PROMPT/INTERVIEW_SYSTEM_PROMPT already use.
 
         Returns:
-            Path: the opened file's path, so the caller (handle_client) can
-            print it for the user to point their separate terminal at.
+            Path: the opened file's path (always LIVE_AGENT_LOG_PATH), so
+            the caller (handle_client) can still print it for anyone not
+            using start_live_agent_listening.sh's hardcoded copy of it.
         """
         LIVE_AGENT_LOG_DIR.mkdir(exist_ok=True)
         started_at = time.localtime()
-        filename = f"live_agent_{time.strftime('%Y-%m-%d_%H%M%S', started_at)}.log"
-        path = LIVE_AGENT_LOG_DIR / filename
+        path = LIVE_AGENT_LOG_PATH
         self._file = open(path, "w", encoding="utf-8")
         self._write(
             f"=== live-agent-listening session started {time.strftime('%Y-%m-%d %H:%M:%S', started_at)} "
