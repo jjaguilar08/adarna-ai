@@ -1041,3 +1041,49 @@ Verified statically: `claude --help` confirms `--permission-mode bypassPermissio
 `claude [options] [prompt]` positional-argument shape the script relies on are both real, current
 CLI flags — not just assumed from Day 18.9's own precedent. Not re-run against a real meeting yet;
 the "needs Jon's own hands" item above is unchanged, just less tedious to actually go do now.
+
+## Day 26 — Manual-Trigger Latency Fix (stale-context suggestions) ✅ implemented and live-verified
+
+Real bug Jon found testing Day 25 live: pressing the hotkey/"Generate Suggestion Now" within a second
+or two of a question finishing sometimes builds a suggestion missing that exact question. Root cause,
+confirmed by tracing the real pipeline rather than guessed: a manual trigger fires `_generate_and_
+send_suggestion()` instantly, but `_format_context()` only ever sees segments already in `recent_
+transcript_segments` — and a segment only lands there after (a) `VoiceSegmenter` sees a real
+`SILENCE_SECONDS_TO_CLOSE_SEGMENT` (0.4s) pause to close it, then (b) a full Whisper decode (2-4s+,
+this project's own established floor). So the realistic gap between "question finished" and "its text
+exists anywhere in the system" is several seconds — clicking inside that window means the segment's
+text hasn't been transcribed yet, not that a faster/"rawer" form of it was available and skipped (Jon
+asked specifically whether the raw pre-transcription Whisper output could be used instead — answered
+directly: there isn't a faster form to reach for, Whisper's text output is the earliest point "what was
+said" exists as text this text-only `claude` CLI architecture can use at all).
+
+**Fix, not a redesign**: only the manual trigger path needed anything — the auto-suggest pause-timer
+path is already immune by construction, since `notify_new_segment()` (which starts its countdown) is
+only ever called *after* a segment is already fully transcribed. New `MeetingSession.
+has_pending_transcription_work()` (a segment still open on either source, via new `VoiceSegmenter.
+has_open_segment()`, OR a new per-session `_pending_transcriptions` counter, incremented/decremented
+around every background transcribe task in `transcribe_segment_and_report`) tells `notify_hotkey_
+pressed()`'s call into `_generate_and_send_suggestion(wait_for_pending_segments=True)` to wait —
+polling, bounded at `MANUAL_TRIGGER_MAX_WAIT_SECONDS` (5.0s) so an unusual stuck case can't hang the
+button — before building context, instead of generating on stale content. Deliberately waits for the
+segment to close and transcribe *naturally* rather than force-cutting it early (which would just trade
+"missing the question" for "truncating the question" mid-sentence). Sends one placeholder `suggestion`
+message ("Still capturing the last few words…") the moment it starts waiting, reusing the exact
+existing message shape/overwrite behavior `SuggestionDisplay` already has — no protocol or `windows_app`
+change needed for that part.
+
+**Live-verified** with two targeted wire-protocol tests against the real production pipeline (real WAV
+audio, real segmentation, real Whisper transcription): (1) hotkey pressed 0.5s into a still-being-spoken
+sentence — placeholder arrived instantly, no suggestion at all followed within the wait window (this
+was the very first segment of the session, so once the wait's cap was hit, `_format_context()` was
+still empty and it correctly no-op'd, same as pre-fix behavior for "nothing transcribed yet" — not a
+regression); (2) hotkey pressed 6.5s in, timed so the pending segment resolves *within* the 5s cap —
+placeholder arrived instantly, then a real suggestion followed once the segment closed and transcribed,
+with its `question` field correctly containing that exact just-finished sentence, confirming the fix's
+actual goal.
+
+Also fixed same session, prompt-only: the live-agent-listening prompt (`docs/live_agent_listening_prompt.txt`)
+was narrating "(silently noting the segments, no output — waiting for TRIGGER)" on every SEGMENT
+notification despite already being told not to acknowledge them — the model explaining its own restraint
+instead of actually staying silent. Tightened to explicitly require zero text output, naming that exact
+line as the failure mode not to repeat.

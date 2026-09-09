@@ -176,6 +176,28 @@ SPEECH_DETECTION_STRICTNESS_BY_SOURCE = {
 # settings_changed.
 PAUSE_SECONDS_BEFORE_SUGGESTION = 1.2
 
+# A manual suggestion trigger (the hotkey, or the "Generate Suggestion Now"
+# button -- both arrive as hotkey_triggered, see SuggestionTrigger.
+# notify_hotkey_pressed) is deliberately instant by design, unlike the pause
+# timer above. But "instant" means it can fire while the very thing that
+# was just said is still mid-speech or mid-transcription -- real user
+# report: pressing it within a second or two of a question finishing
+# sometimes builds a suggestion that's missing that question entirely,
+# since MeetingSession.add_transcript_segment() (and therefore
+# _format_context()) hasn't seen it yet. If MeetingSession.
+# has_pending_transcription_work() says something's still in flight when a
+# manual trigger fires, it waits (polling at MANUAL_TRIGGER_WAIT_POLL_SECONDS
+# intervals) for up to MANUAL_TRIGGER_MAX_WAIT_SECONDS before building
+# context anyway -- capped so an unusual case (e.g. VAD never detecting a
+# pause) can't hang the button indefinitely; past the cap, generation
+# proceeds with whatever's available, same as before this existed. The
+# pause-timer path doesn't need this: it only ever starts counting down
+# after a segment is already fully transcribed (notify_new_segment() is
+# only called from add_transcript_segment()), so it can't fire on stale
+# context by construction.
+MANUAL_TRIGGER_MAX_WAIT_SECONDS = 5.0
+MANUAL_TRIGGER_WAIT_POLL_SECONDS = 0.3
+
 # How much recent transcript text is kept and sent as context with each
 # suggestion request. Originally (Day 7) a fixed count of 10 segments,
 # sized around a single audio source -- Day 18.7's context-feed spike
@@ -555,6 +577,18 @@ class VoiceSegmenter:
             return None
         return self._close_current_segment(closed_on_forced_timeout=False)
 
+    def has_open_segment(self):
+        """
+        Returns:
+            bool: True if a segment is currently being recorded (someone's
+            still mid-speech, or in the brief window before a pause is long
+            enough to close it) -- used by MeetingSession.
+            has_pending_transcription_work() to tell a manual suggestion
+            trigger to wait rather than build a suggestion from context
+            that's about to be stale.
+        """
+        return self._segment_is_open
+
 
 def segment_duration_seconds(audio_bytes):
     """
@@ -612,23 +646,37 @@ async def transcribe_segment_and_report(
     "Xs to transcribe" duration includes any time spent waiting for the
     lock, which is real, user-facing latency either way. `closed_on_forced_
     timeout` is passed straight through to transcribe_segment() -- see its
-    docstring.
+    docstring. Brackets the whole call in session.mark_transcription_started()/
+    mark_transcription_finished() (skipped when session is None, the same
+    trailing-flush-after-stop case noted above) -- see
+    MeetingSession.has_pending_transcription_work() for why: a manual
+    suggestion trigger needs to know this transcription is in flight so it
+    can wait for it rather than building a suggestion from context that's
+    about to be stale.
     """
-    duration_seconds = segment_duration_seconds(audio_bytes)
-    transcribe_started_at = time.monotonic()
-    async with transcribe_lock:
-        text = await asyncio.to_thread(transcribe_segment, model, audio_bytes, closed_on_forced_timeout)
-    elapsed_seconds = time.monotonic() - transcribe_started_at
-    timestamp = time.strftime("%H:%M:%S")
-    spoken_text = text if text else "(no speech detected)"
-    print(
-        f"[{timestamp}] Transcript ({source}, {duration_seconds:.1f}s segment, "
-        f"{elapsed_seconds:.1f}s to transcribe): {spoken_text}"
-    )
-    if text:
-        await send_message(writer, {"type": "transcript", "text": text, "source": source, "started_at": started_at})
+    if session is not None:
+        session.mark_transcription_started()
+    try:
+        duration_seconds = segment_duration_seconds(audio_bytes)
+        transcribe_started_at = time.monotonic()
+        async with transcribe_lock:
+            text = await asyncio.to_thread(transcribe_segment, model, audio_bytes, closed_on_forced_timeout)
+        elapsed_seconds = time.monotonic() - transcribe_started_at
+        timestamp = time.strftime("%H:%M:%S")
+        spoken_text = text if text else "(no speech detected)"
+        print(
+            f"[{timestamp}] Transcript ({source}, {duration_seconds:.1f}s segment, "
+            f"{elapsed_seconds:.1f}s to transcribe): {spoken_text}"
+        )
+        if text:
+            await send_message(
+                writer, {"type": "transcript", "text": text, "source": source, "started_at": started_at}
+            )
+            if session is not None:
+                session.add_transcript_segment(source, text, started_at)
+    finally:
         if session is not None:
-            session.add_transcript_segment(source, text, started_at)
+            session.mark_transcription_finished()
 
 
 def handle_finished_segment(model, transcribe_lock, writer, closed_segment, source, session=None):
@@ -639,7 +687,9 @@ def handle_finished_segment(model, transcribe_lock, writer, closed_segment, sour
     full, slow model call for nothing), or kick off background
     transcription-and-reporting otherwise. `transcribe_lock`, `source`, and
     `session` are passed through to transcribe_segment_and_report() -- see
-    its docstring.
+    its docstring. A segment skipped here (too short) was never open long
+    enough to matter to has_pending_transcription_work() either, so there's
+    nothing to mark pending for it.
     """
     duration_seconds = segment_duration_seconds(closed_segment.audio_bytes)
     if duration_seconds < MIN_SEGMENT_SECONDS_TO_TRANSCRIBE:
@@ -1456,12 +1506,20 @@ class SuggestionTrigger:
             self._cancel_pause_timer()
 
     def notify_hotkey_pressed(self):
-        """Call when windows_app reports the hotkey was pressed. See class docstring, step 3. A no-op once stopped."""
+        """
+        Call when windows_app reports the hotkey was pressed. See class
+        docstring, step 3. A no-op once stopped. Passes
+        wait_for_pending_segments=True to the generator (see
+        MeetingSession._generate_and_send_suggestion) -- unlike the pause
+        timer below, this fires instantly with no built-in wait of its own,
+        so it's the one path that can otherwise catch a segment mid-speech
+        or mid-transcription and build a suggestion missing it.
+        """
         if self._stopped:
             return
         self._cancel_pause_timer()
         self._new_segment_since_last_suggestion = False
-        asyncio.create_task(self._generate_suggestion())
+        asyncio.create_task(self._generate_suggestion(wait_for_pending_segments=True))
 
     def stop(self):
         """
@@ -1480,7 +1538,15 @@ class SuggestionTrigger:
             self._pause_timer_task = None
 
     async def _wait_then_fire(self):
-        """Waits out the pause duration, then fires. See class docstring, step 2."""
+        """
+        Waits out the pause duration, then fires. See class docstring, step
+        2. Doesn't pass wait_for_pending_segments (defaults False) --
+        unlike notify_hotkey_pressed(), this can't fire on a segment that's
+        still mid-speech or mid-transcription in the first place: it only
+        ever starts counting down after notify_new_segment() has already
+        been called, which only happens once a segment is fully
+        transcribed (see MeetingSession.add_transcript_segment()).
+        """
         await asyncio.sleep(self._pause_seconds)
         if not self._new_segment_since_last_suggestion:
             return
@@ -1539,6 +1605,11 @@ class MeetingSession:
         # Each entry is (started_at, source, text), kept sorted by
         # started_at -- see add_transcript_segment().
         self.recent_transcript_segments = []
+        # How many segments are currently mid-transcription (closed, handed
+        # to a background task, not yet reported) -- see
+        # mark_transcription_started()/mark_transcription_finished() and
+        # has_pending_transcription_work().
+        self._pending_transcriptions = 0
         self._system_prompt = build_system_prompt(mode, context_notes)
         print(f"Starting claude CLI process for this session (mode: {mode})...")
         self._claude_cli = ClaudeCli(self._system_prompt)
@@ -1559,6 +1630,29 @@ class MeetingSession:
     def set_auto_suggest_enabled(self, enabled):
         """Turns this session's pause-triggered suggestions on or off, live. See SuggestionTrigger.set_auto_suggest_enabled."""
         self.trigger.set_auto_suggest_enabled(enabled)
+
+    def mark_transcription_started(self):
+        """Records that one more segment is now mid-transcription -- call once per background transcribe task started (see transcribe_segment_and_report)."""
+        self._pending_transcriptions += 1
+
+    def mark_transcription_finished(self):
+        """Records that one mid-transcription segment has finished, one way or another -- call once per background transcribe task, regardless of outcome (see transcribe_segment_and_report's finally block)."""
+        self._pending_transcriptions -= 1
+
+    def has_pending_transcription_work(self):
+        """
+        Returns:
+            bool: True if either audio source currently has a segment
+            still mid-speech (see VoiceSegmenter.has_open_segment()) or
+            already closed but not yet transcribed -- used by a manual
+            suggestion trigger (see MANUAL_TRIGGER_MAX_WAIT_SECONDS) to
+            decide whether to wait before building a suggestion, so a
+            press right as someone finishes talking doesn't build one from
+            context that's about to change out from under it.
+        """
+        return self._pending_transcriptions > 0 or any(
+            segmenter.has_open_segment() for segmenter in self.segmenters.values()
+        )
 
     def add_transcript_segment(self, source, text, started_at):
         """
@@ -1603,7 +1697,7 @@ class MeetingSession:
         """
         return "\n".join(f"{SOURCE_LABELS[source]}: {text}" for _started_at, source, text in self.recent_transcript_segments)
 
-    async def _generate_and_send_suggestion(self):
+    async def _generate_and_send_suggestion(self, wait_for_pending_segments=False):
         """
         Asks claude for one suggestion based on the recent transcript
         context and sends it to windows_app as a "suggestion" message,
@@ -1648,10 +1742,34 @@ class MeetingSession:
         already silently no-ops on via the prompt_text check below, doesn't
         also tell a tailing agent "answer now" with nothing yet in the log
         to answer from.
+
+        `wait_for_pending_segments` -- True only for a manual (hotkey/
+        button) trigger, see SuggestionTrigger.notify_hotkey_pressed() --
+        makes this wait for MeetingSession.has_pending_transcription_work()
+        to clear (bounded, see MANUAL_TRIGGER_MAX_WAIT_SECONDS) before
+        building context, so a press made right as someone finishes talking
+        doesn't build a suggestion that's missing what they just said. The
+        pause-timer path never passes this: it can't fire on stale context
+        in the first place (see that constant's own comment). While
+        waiting, sends one placeholder "suggestion" message so the overlay
+        doesn't just sit blank -- windows_app's SuggestionDisplay already
+        overwrites the pane with whatever text it's given next, so the real
+        answer below simply replaces it once ready, no protocol/UI change
+        needed.
         """
         if self._claude_cli_lock.locked():
             return
         async with self._claude_cli_lock:
+            if wait_for_pending_segments and self.has_pending_transcription_work():
+                await send_message(
+                    self.writer,
+                    {
+                        "type": "suggestion",
+                        "text": "Still capturing the last few words…",
+                        "question": self._format_context(),
+                    },
+                )
+                await self._wait_for_pending_transcriptions()
             prompt_text = self._format_context()
             if not prompt_text:
                 return
@@ -1675,6 +1793,21 @@ class MeetingSession:
                 {"type": "suggestion", "text": suggestion_text, "question": prompt_text},
             )
             await self._count_ask_call_and_recycle_if_due()
+
+    async def _wait_for_pending_transcriptions(self):
+        """
+        Polls has_pending_transcription_work() until it clears or
+        MANUAL_TRIGGER_MAX_WAIT_SECONDS has elapsed -- see that constant's
+        own comment for why a manual suggestion trigger needs this. Polls
+        rather than awaiting one specific event, since pending work is
+        spread across two independent per-source segmenters plus however
+        many background transcribe tasks happen to be in flight, with no
+        single future that resolves once all of them are done.
+        """
+        elapsed_seconds = 0.0
+        while self.has_pending_transcription_work() and elapsed_seconds < MANUAL_TRIGGER_MAX_WAIT_SECONDS:
+            await asyncio.sleep(MANUAL_TRIGGER_WAIT_POLL_SECONDS)
+            elapsed_seconds += MANUAL_TRIGGER_WAIT_POLL_SECONDS
 
     async def _ask_with_restart_on_crash(self, prompt_text, on_partial_text=None):
         """
