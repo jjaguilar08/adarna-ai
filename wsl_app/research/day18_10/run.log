@@ -1,0 +1,457 @@
+23:21:02 [34505.30] HARNESS_START mode=full_run cycles=9 clips_per_cycle=5 pause_seconds_before_suggestion=1.2 estimated_duration_seconds=2632 (43.9 min)
+Loading small.en...
+23:21:04 [34507.29] CYCLE_START #1
+23:21:04 [34507.29] CLIP_START en_normal.wav duration=45.8s
+23:21:11 [34514.22] SEGMENT (1.9s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:21:12 [34515.43] TRIGGER #1 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:21:21 [34524.06] SEGMENT (1.8s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:21:22 [34525.26] TRIGGER #2 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:21:34 [34535.03] SEGMENT (2.0s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:21:35 [34536.23] TRIGGER #3 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:21:47 [34548.05] SEGMENT (2.0s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual-riding for a week before we retire the old table entirely.
+23:21:48 [34549.26] TRIGGER #4 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:22:05 [34563.22] SEGMENT (2.4s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:22:05 [34563.52] CLIP_END en_normal.wav
+23:22:06 [34564.42] TRIGGER #5 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:22:08 [34566.53] CLIP_START en_fast.wav duration=16.4s
+23:22:09 [34567.30] HEARTBEAT segments=5 triggers=5 errors=0
+23:22:25 [34583.08] CLIP_END en_fast.wav
+23:22:28 [34586.70] SEGMENT (3.4s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:22:30 [34587.90] TRIGGER #6 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:22:31 [34589.51] CLIP_START taglish.wav duration=35.5s
+23:22:41 [34596.44] SEGMENT (1.8s to transcribe): Okay so, Ang plan Nathan is we need to finish young deliverable by Friday.
+23:22:42 [34597.64] TRIGGER #7 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:22:49 [34604.45] SEGMENT (2.1s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:22:50 [34605.65] TRIGGER #8 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:22:57 [34612.48] SEGMENT (1.8s to transcribe): Me diotite young timeline para okea naden 2, as long as we communicate clearly.
+23:22:58 [34613.68] TRIGGER #9 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:23:12 [34625.19] SEGMENT (2.1s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time Nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:23:14 [34626.40] TRIGGER #10 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:23:14 [34627.30] HEARTBEAT segments=10 triggers=10 errors=0
+23:23:22 [34634.80] SEGMENT (2.1s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:23:22 [34635.00] CLIP_END taglish.wav
+23:23:23 [34636.00] TRIGGER #11 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:23:25 [34638.01] CLIP_START zira_clip.wav duration=41.2s
+23:23:39 [34651.65] SEGMENT (2.3s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:23:40 [34652.85] TRIGGER #12 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:23:49 [34659.68] SEGMENT (1.8s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:23:50 [34660.88] TRIGGER #13 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:24:03 [34673.33] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:24:04 [34674.54] TRIGGER #14 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:24:17 [34687.30] HEARTBEAT segments=14 triggers=14 errors=0
+23:24:17 [34687.70] SEGMENT (2.3s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:24:20 [34688.00] CLIP_END zira_clip.wav
+23:24:21 [34688.90] TRIGGER #15 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:24:23 [34691.01] CLIP_START fast_long.wav duration=39.5s
+23:25:05 [34730.74] CLIP_END fast_long.wav
+23:25:13 [34738.82] SEGMENT (7.9s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat roll out for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:25:14 [34740.02] TRIGGER #16 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:25:16 [34741.63] CYCLE_END #1 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.50s
+23:25:16 [34741.63] CYCLE_START #2
+23:25:16 [34741.63] CLIP_START en_normal.wav duration=45.8s
+23:25:21 [34747.30] HEARTBEAT segments=16 triggers=16 errors=0
+23:25:23 [34748.36] SEGMENT (1.7s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:25:24 [34749.56] TRIGGER #17 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:25:35 [34758.30] SEGMENT (1.9s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:25:36 [34759.50] TRIGGER #18 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:25:46 [34769.03] SEGMENT (1.8s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:25:47 [34770.24] TRIGGER #19 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:25:59 [34782.14] SEGMENT (2.1s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual-riding for a week before we retire the old table entirely.
+23:26:00 [34783.34] TRIGGER #20 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:26:17 [34797.13] SEGMENT (2.2s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:26:17 [34797.43] CLIP_END en_normal.wav
+23:26:18 [34798.33] TRIGGER #21 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:26:20 [34800.44] CLIP_START en_fast.wav duration=16.4s
+23:26:27 [34807.30] HEARTBEAT segments=21 triggers=21 errors=0
+23:26:39 [34816.99] CLIP_END en_fast.wav
+23:26:43 [34820.68] SEGMENT (3.5s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:26:44 [34821.88] TRIGGER #22 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:26:46 [34823.49] CLIP_START taglish.wav duration=35.5s
+23:26:52 [34830.19] SEGMENT (1.6s to transcribe): Okay so, Ang plan Nathan is we need to finish young deliverable by Friday.
+23:26:54 [34831.40] TRIGGER #23 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:27:00 [34837.99] SEGMENT (1.9s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:27:01 [34839.19] TRIGGER #24 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:27:08 [34845.88] SEGMENT (1.7s to transcribe): Me diotite young timeline para okea nadun 2, as long as we communicate clearly.
+23:27:09 [34847.08] TRIGGER #25 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:27:23 [34858.60] SEGMENT (2.1s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:27:25 [34859.80] TRIGGER #26 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:27:32 [34867.30] HEARTBEAT segments=26 triggers=26 errors=0
+23:27:33 [34867.97] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:27:33 [34868.17] CLIP_END taglish.wav
+23:27:34 [34869.17] TRIGGER #27 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:27:36 [34871.18] CLIP_START zira_clip.wav duration=41.2s
+23:27:53 [34884.91] SEGMENT (2.4s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:27:54 [34886.11] TRIGGER #28 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:28:00 [34892.82] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:28:02 [34894.02] TRIGGER #29 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:28:14 [34906.54] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:28:15 [34907.74] TRIGGER #30 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:28:31 [34920.76] SEGMENT (2.2s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:28:31 [34920.96] CLIP_END zira_clip.wav
+23:28:32 [34921.96] TRIGGER #31 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:28:34 [34923.97] CLIP_START fast_long.wav duration=39.5s
+23:28:38 [34927.30] HEARTBEAT segments=31 triggers=31 errors=0
+23:29:17 [34963.69] CLIP_END fast_long.wav
+23:29:26 [34972.92] SEGMENT (9.0s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90ms up to almost 450ms for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. Three inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed the feature flat roll out for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... So the uncalled handoff notes from last night mention a flaky test in the shipping calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:29:27 [34974.12] TRIGGER #32 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:29:29 [34975.73] CYCLE_END #2 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.48s
+23:29:29 [34975.73] CYCLE_START #3
+23:29:29 [34975.73] CLIP_START en_normal.wav duration=45.8s
+23:29:38 [34982.47] SEGMENT (1.7s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:29:39 [34983.67] TRIGGER #33 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:29:43 [34987.30] HEARTBEAT segments=33 triggers=33 errors=0
+23:29:48 [34992.30] SEGMENT (1.8s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:29:49 [34993.50] TRIGGER #34 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:29:59 [35003.10] SEGMENT (1.9s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:30:00 [35004.31] TRIGGER #35 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:30:15 [35016.34] SEGMENT (2.2s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual writing for a week before we retire the old table entirely.
+23:30:16 [35017.54] TRIGGER #36 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:30:28 [35029.38] CLIP_END en_normal.wav
+23:30:32 [35033.24] SEGMENT (2.3s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:30:33 [35034.44] TRIGGER #37 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:30:33 [35034.64] CLIP_START en_fast.wav duration=16.4s
+23:30:49 [35047.30] HEARTBEAT segments=37 triggers=37 errors=0
+23:30:53 [35051.20] CLIP_END en_fast.wav
+23:30:56 [35054.97] SEGMENT (3.6s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:30:58 [35056.17] TRIGGER #38 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:30:59 [35057.78] CLIP_START taglish.wav duration=35.5s
+23:31:06 [35064.60] SEGMENT (1.7s to transcribe): Okay so, Ang plan Nathan is we need to finish young deliverable by Friday
+23:31:07 [35065.80] TRIGGER #39 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:31:14 [35072.43] SEGMENT (1.9s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:31:15 [35073.63] TRIGGER #40 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:31:25 [35080.43] SEGMENT (1.8s to transcribe): Me diotite young timeline para okea nadun 2, as long as we communicate clearly.
+23:31:26 [35081.63] TRIGGER #41 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:31:37 [35093.24] SEGMENT (2.1s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:31:39 [35094.45] TRIGGER #42 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:31:47 [35102.43] SEGMENT (1.8s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:31:47 [35102.63] CLIP_END taglish.wav
+23:31:48 [35103.63] TRIGGER #43 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:31:50 [35105.64] CLIP_START zira_clip.wav duration=41.2s
+23:31:54 [35107.31] HEARTBEAT segments=43 triggers=43 errors=0
+23:32:06 [35119.09] SEGMENT (2.1s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:32:07 [35120.29] TRIGGER #44 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:32:14 [35127.01] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:32:15 [35128.21] TRIGGER #45 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:32:30 [35140.74] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:32:32 [35141.94] TRIGGER #46 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:32:45 [35154.94] SEGMENT (2.2s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:32:45 [35155.14] CLIP_END zira_clip.wav
+23:32:46 [35156.14] TRIGGER #47 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:32:48 [35158.15] CLIP_START fast_long.wav duration=39.5s
+23:32:57 [35167.31] HEARTBEAT segments=47 triggers=47 errors=0
+23:33:31 [35197.88] CLIP_END fast_long.wav
+23:33:31 [35197.88] IDLE_START duration=300s (simulating a quiet stretch of a real meeting)
+23:33:42 [35206.31] SEGMENT (8.1s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:33:43 [35207.51] TRIGGER #48 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:34:03 [35227.31] HEARTBEAT segments=48 triggers=48 errors=0
+23:35:08 [35287.31] HEARTBEAT segments=48 triggers=48 errors=0
+23:36:14 [35347.31] HEARTBEAT segments=48 triggers=48 errors=0
+23:37:20 [35407.31] HEARTBEAT segments=48 triggers=48 errors=0
+23:38:25 [35467.31] HEARTBEAT segments=48 triggers=48 errors=0
+23:39:08 [35506.94] IDLE_END
+23:39:08 [35506.94] CYCLE_END #3 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.43s
+23:39:08 [35506.94] CYCLE_START #4
+23:39:08 [35506.94] CLIP_START en_normal.wav duration=45.8s
+23:39:15 [35513.71] SEGMENT (1.8s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:39:16 [35514.91] TRIGGER #49 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:39:25 [35523.53] SEGMENT (1.8s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:39:26 [35524.74] TRIGGER #50 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:39:31 [35527.31] HEARTBEAT segments=50 triggers=50 errors=0
+23:39:38 [35534.23] SEGMENT (1.8s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:39:39 [35535.43] TRIGGER #51 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:39:51 [35547.30] SEGMENT (2.0s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual-riding for a week before we retire the old table entirely.
+23:39:52 [35548.50] TRIGGER #52 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:40:07 [35560.34] CLIP_END en_normal.wav
+23:40:11 [35564.17] SEGMENT (2.2s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:40:12 [35565.37] TRIGGER #53 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:40:12 [35565.58] CLIP_START en_fast.wav duration=16.4s
+23:40:29 [35582.13] CLIP_END en_fast.wav
+23:40:32 [35585.73] SEGMENT (3.4s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:40:34 [35586.93] TRIGGER #54 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:40:34 [35587.31] HEARTBEAT segments=54 triggers=54 errors=0
+23:40:35 [35588.53] CLIP_START taglish.wav duration=35.5s
+23:40:45 [35595.32] SEGMENT (1.7s to transcribe): Okay so, Ang plan Nathan is we need to finish young deliverable by Friday
+23:40:46 [35596.52] TRIGGER #55 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:40:59 [35609.77] SEGMENT (2.3s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end. Mi dio tight young timeline pero que unadentu, as long as we communicate clearly.
+23:41:01 [35610.97] TRIGGER #56 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:41:12 [35622.53] SEGMENT (2.0s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:41:16 [35623.73] TRIGGER #57 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:41:24 [35631.89] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:41:25 [35632.09] CLIP_END taglish.wav
+23:41:26 [35633.09] TRIGGER #58 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:41:28 [35635.10] CLIP_START zira_clip.wav duration=41.2s
+23:41:40 [35647.31] HEARTBEAT segments=58 triggers=58 errors=0
+23:41:41 [35648.48] SEGMENT (1.9s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:41:42 [35649.68] TRIGGER #59 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:41:51 [35656.40] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:41:52 [35657.60] TRIGGER #60 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:42:05 [35670.02] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:42:06 [35671.22] TRIGGER #61 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:42:19 [35684.14] SEGMENT (2.1s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:42:19 [35684.34] CLIP_END zira_clip.wav
+23:42:20 [35685.34] TRIGGER #62 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:42:22 [35687.35] CLIP_START fast_long.wav duration=39.5s
+23:42:45 [35707.31] HEARTBEAT segments=62 triggers=62 errors=0
+23:43:07 [35727.08] CLIP_END fast_long.wav
+23:43:15 [35735.21] SEGMENT (7.9s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:43:16 [35736.41] TRIGGER #63 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:43:18 [35738.02] CYCLE_END #4 segments=15 empty=0 triggers=15 avg_transcribe_latency=2.44s
+23:43:18 [35738.02] CYCLE_START #5
+23:43:18 [35738.02] CLIP_START en_normal.wav duration=45.8s
+23:43:25 [35744.79] SEGMENT (1.6s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:43:26 [35745.99] TRIGGER #64 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:43:38 [35754.71] SEGMENT (2.0s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:43:39 [35755.91] TRIGGER #65 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:43:48 [35765.35] SEGMENT (1.7s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:43:49 [35766.55] TRIGGER #66 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:43:50 [35767.32] HEARTBEAT segments=66 triggers=66 errors=0
+23:44:01 [35778.43] SEGMENT (2.0s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual writing for a week before we retire the old table entirely.
+23:44:03 [35779.63] TRIGGER #67 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:44:19 [35793.58] SEGMENT (2.4s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:44:19 [35793.88] CLIP_END en_normal.wav
+23:44:20 [35794.78] TRIGGER #68 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:44:22 [35796.89] CLIP_START en_fast.wav duration=16.4s
+23:44:39 [35813.43] CLIP_END en_fast.wav
+23:44:45 [35817.19] SEGMENT (3.6s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:44:46 [35818.39] TRIGGER #69 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:44:48 [35820.00] CLIP_START taglish.wav duration=35.5s
+23:44:55 [35826.96] SEGMENT (1.7s to transcribe): Okay so, Angplan Nathan is we need to finish young deliverable by Friday.
+23:44:55 [35827.32] HEARTBEAT segments=70 triggers=69 errors=0
+23:44:56 [35828.16] TRIGGER #70 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:45:03 [35834.81] SEGMENT (2.0s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:45:04 [35836.01] TRIGGER #71 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:45:11 [35842.83] SEGMENT (1.8s to transcribe): Me diotite young timeline pero que anadin 2, as long as we communicate clearly.
+23:45:12 [35844.03] TRIGGER #72 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:45:26 [35855.79] SEGMENT (2.2s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:45:28 [35856.99] TRIGGER #73 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:45:36 [35865.10] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:45:36 [35865.30] CLIP_END taglish.wav
+23:45:37 [35866.30] TRIGGER #74 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:45:39 [35868.31] CLIP_START zira_clip.wav duration=41.2s
+23:45:55 [35881.71] SEGMENT (2.1s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:45:56 [35882.91] TRIGGER #75 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:46:01 [35887.32] HEARTBEAT segments=75 triggers=75 errors=0
+23:46:03 [35889.65] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:46:04 [35890.85] TRIGGER #76 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:46:17 [35903.36] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:46:18 [35904.56] TRIGGER #77 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:46:33 [35917.49] SEGMENT (2.1s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:46:34 [35917.69] CLIP_END zira_clip.wav
+23:46:35 [35918.69] TRIGGER #78 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:46:37 [35920.70] CLIP_START fast_long.wav duration=39.5s
+23:47:06 [35947.32] HEARTBEAT segments=78 triggers=78 errors=0
+23:47:19 [35960.43] CLIP_END fast_long.wav
+23:47:27 [35968.53] SEGMENT (7.8s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:47:29 [35969.73] TRIGGER #79 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:47:30 [35971.24] CYCLE_END #5 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.42s
+23:47:30 [35971.24] CYCLE_START #6
+23:47:30 [35971.24] CLIP_START en_normal.wav duration=45.8s
+23:47:39 [35978.02] SEGMENT (1.8s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:47:41 [35979.22] TRIGGER #80 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:47:49 [35987.90] SEGMENT (1.8s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+23:47:50 [35989.10] TRIGGER #81 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:48:00 [35998.67] SEGMENT (1.8s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:48:01 [35999.87] TRIGGER #82 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:48:09 [36007.32] HEARTBEAT segments=82 triggers=82 errors=0
+23:48:16 [36011.84] SEGMENT (2.1s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual writing for a week before we retire the old table entirely.
+23:48:17 [36013.04] TRIGGER #83 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:48:31 [36026.73] SEGMENT (2.1s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:48:31 [36027.03] CLIP_END en_normal.wav
+23:48:32 [36027.93] TRIGGER #84 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:48:34 [36030.04] CLIP_START en_fast.wav duration=16.4s
+23:48:53 [36046.58] CLIP_END en_fast.wav
+23:48:59 [36052.61] SEGMENT (3.5s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:49:00 [36053.11] CLIP_START taglish.wav duration=35.5s
+23:49:00 [36053.81] TRIGGER #85 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:49:07 [36060.09] SEGMENT (1.8s to transcribe): Okay so, Ang plan Nathan is we need to finish young deliverable by Friday
+23:49:08 [36061.30] TRIGGER #86 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:49:14 [36067.32] HEARTBEAT segments=86 triggers=86 errors=0
+23:49:14 [36067.91] SEGMENT (2.0s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:49:16 [36069.11] TRIGGER #87 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:49:37 [36087.41] SEGMENT (2.5s to transcribe): Me diotite young timeline para okea nadin 2, as long as we communicate clearly. Let's also make sure NA update nadin young documentation bag o mag deploy, kasi last time nikolimutan nadin at nag cause NG confusion SAQA team.
+23:49:38 [36088.61] TRIGGER #88 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:49:46 [36096.71] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:49:46 [36096.91] CLIP_END taglish.wav
+23:49:47 [36097.91] TRIGGER #89 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:49:49 [36099.92] CLIP_START zira_clip.wav duration=41.2s
+23:50:05 [36113.44] SEGMENT (2.2s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:50:06 [36114.64] TRIGGER #90 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:50:13 [36121.53] SEGMENT (1.8s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:50:14 [36122.73] TRIGGER #91 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:50:19 [36127.32] HEARTBEAT segments=91 triggers=91 errors=0
+23:50:27 [36135.22] SEGMENT (2.2s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+23:50:28 [36136.42] TRIGGER #92 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:50:44 [36149.48] SEGMENT (2.2s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+23:50:44 [36149.68] CLIP_END zira_clip.wav
+23:50:45 [36150.68] TRIGGER #93 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:50:47 [36152.69] CLIP_START fast_long.wav duration=39.5s
+23:51:24 [36187.32] HEARTBEAT segments=93 triggers=93 errors=0
+23:51:29 [36192.42] CLIP_END fast_long.wav
+23:51:29 [36192.42] IDLE_START duration=300s (simulating a quiet stretch of a real meeting)
+23:51:37 [36200.56] SEGMENT (7.9s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+23:51:39 [36201.76] TRIGGER #94 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:52:29 [36247.32] HEARTBEAT segments=94 triggers=94 errors=0
+23:53:35 [36307.33] HEARTBEAT segments=94 triggers=94 errors=0
+23:54:39 [36367.33] HEARTBEAT segments=94 triggers=94 errors=0
+23:55:42 [36427.33] HEARTBEAT segments=94 triggers=94 errors=0
+23:56:47 [36487.33] HEARTBEAT segments=94 triggers=94 errors=0
+23:57:04 [36501.32] IDLE_END
+23:57:04 [36501.32] CYCLE_END #6 segments=15 empty=0 triggers=15 avg_transcribe_latency=2.51s
+23:57:04 [36501.32] CYCLE_START #7
+23:57:04 [36501.32] CLIP_START en_normal.wav duration=45.8s
+23:57:11 [36508.08] SEGMENT (1.6s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+23:57:12 [36509.28] TRIGGER #95 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:57:33 [36527.20] SEGMENT (2.3s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths. Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+23:57:34 [36528.40] TRIGGER #96 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:57:46 [36540.29] SEGMENT (2.1s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual writing for a week before we retire the old table entirely.
+23:57:47 [36541.49] TRIGGER #97 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:57:53 [36547.33] HEARTBEAT segments=97 triggers=97 errors=0
+23:57:59 [36553.33] CLIP_END en_normal.wav
+23:58:03 [36557.19] SEGMENT (2.3s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+23:58:07 [36558.39] TRIGGER #98 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:58:07 [36558.60] CLIP_START en_fast.wav duration=16.4s
+23:58:23 [36575.15] CLIP_END en_fast.wav
+23:58:27 [36578.76] SEGMENT (3.4s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+23:58:28 [36579.96] TRIGGER #99 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:58:30 [36581.57] CLIP_START taglish.wav duration=35.5s
+23:58:37 [36588.49] SEGMENT (1.7s to transcribe): Okay so, Angplan Nathan is we need to finish young deliverable by Friday.
+23:58:38 [36589.70] TRIGGER #100 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:58:48 [36596.38] SEGMENT (2.1s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+23:58:49 [36597.58] TRIGGER #101 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:58:56 [36604.40] SEGMENT (1.8s to transcribe): Me diotite young timeline pero que enate en tu, as long as we communicate clearly.
+23:58:57 [36605.60] TRIGGER #102 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:58:59 [36607.33] HEARTBEAT segments=102 triggers=102 errors=0
+23:59:09 [36617.34] SEGMENT (2.2s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+23:59:10 [36618.54] TRIGGER #103 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:59:21 [36626.67] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+23:59:21 [36626.87] CLIP_END taglish.wav
+23:59:22 [36627.87] TRIGGER #104 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:59:24 [36629.88] CLIP_START zira_clip.wav duration=41.2s
+23:59:37 [36643.29] SEGMENT (2.1s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+23:59:38 [36644.49] TRIGGER #105 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+23:59:45 [36651.31] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+23:59:46 [36652.51] TRIGGER #106 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:00:02 [36664.99] SEGMENT (2.1s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+00:00:03 [36666.19] TRIGGER #107 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:00:04 [36667.33] HEARTBEAT segments=107 triggers=107 errors=0
+00:00:16 [36679.22] SEGMENT (2.2s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+00:00:16 [36679.42] CLIP_END zira_clip.wav
+00:00:17 [36680.42] TRIGGER #108 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:00:19 [36682.43] CLIP_START fast_long.wav duration=39.5s
+00:01:04 [36722.16] CLIP_END fast_long.wav
+00:01:10 [36727.34] HEARTBEAT segments=108 triggers=108 errors=0
+00:01:13 [36730.77] SEGMENT (8.3s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+00:01:14 [36731.97] TRIGGER #109 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:01:16 [36733.47] CYCLE_END #7 segments=15 empty=0 triggers=15 avg_transcribe_latency=2.51s
+00:01:16 [36733.47] CYCLE_START #8
+00:01:16 [36733.47] CLIP_START en_normal.wav duration=45.8s
+00:01:23 [36740.20] SEGMENT (1.7s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+00:01:24 [36741.40] TRIGGER #110 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:01:32 [36750.06] SEGMENT (1.8s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+00:01:34 [36751.26] TRIGGER #111 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:01:46 [36760.90] SEGMENT (1.9s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+00:01:47 [36762.11] TRIGGER #112 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:01:59 [36774.15] SEGMENT (2.1s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual writing for a week before we retire the old table entirely.
+00:02:00 [36775.35] TRIGGER #113 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:02:15 [36787.10] CLIP_END en_normal.wav
+00:02:15 [36787.34] HEARTBEAT segments=113 triggers=113 errors=0
+00:02:19 [36791.09] SEGMENT (2.4s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+00:02:20 [36792.30] TRIGGER #114 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:02:20 [36792.50] CLIP_START en_fast.wav duration=16.4s
+00:02:37 [36809.05] CLIP_END en_fast.wav
+00:02:40 [36812.62] SEGMENT (3.4s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+00:02:42 [36813.82] TRIGGER #115 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:02:43 [36815.43] CLIP_START taglish.wav duration=35.5s
+00:02:53 [36822.37] SEGMENT (1.8s to transcribe): Okay so, Angplan Nathan is we need to finish young deliverable by Friday
+00:02:54 [36823.57] TRIGGER #116 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:03:01 [36830.23] SEGMENT (1.9s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+00:03:02 [36831.44] TRIGGER #117 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:03:09 [36838.20] SEGMENT (1.7s to transcribe): Me diotite young timeline pero que inadun 2, as long as we communicate clearly.
+00:03:10 [36839.40] TRIGGER #118 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:03:18 [36847.34] HEARTBEAT segments=118 triggers=118 errors=0
+00:03:24 [36851.28] SEGMENT (2.3s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan Nathan at NAG cause NG confusion SAQA team.
+00:03:26 [36852.48] TRIGGER #119 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:03:34 [36860.49] SEGMENT (1.8s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+00:03:34 [36860.69] CLIP_END taglish.wav
+00:03:35 [36861.69] TRIGGER #120 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:03:37 [36863.70] CLIP_START zira_clip.wav duration=41.2s
+00:03:50 [36877.07] SEGMENT (2.0s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+00:03:51 [36878.27] TRIGGER #121 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:04:00 [36885.07] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+00:04:02 [36886.27] TRIGGER #122 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:04:14 [36898.86] SEGMENT (2.3s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+00:04:15 [36900.06] TRIGGER #123 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:04:23 [36907.34] HEARTBEAT segments=123 triggers=123 errors=0
+00:04:31 [36913.10] SEGMENT (2.2s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+00:04:32 [36913.31] CLIP_END zira_clip.wav
+00:04:33 [36914.31] TRIGGER #124 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:04:35 [36916.32] CLIP_START fast_long.wav duration=39.5s
+00:05:17 [36956.05] CLIP_END fast_long.wav
+00:05:25 [36964.13] SEGMENT (7.8s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that door tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+00:05:26 [36965.33] TRIGGER #125 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:05:27 [36966.84] CYCLE_END #8 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.43s
+00:05:27 [36966.84] CYCLE_START #9
+00:05:27 [36966.84] CLIP_START en_normal.wav duration=45.8s
+00:05:28 [36967.34] HEARTBEAT segments=125 triggers=125 errors=0
+00:05:34 [36973.46] SEGMENT (1.6s to transcribe): So the way I'm thinking about this is we should split the migration into three phases.
+00:05:35 [36974.66] TRIGGER #126 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:05:47 [36983.43] SEGMENT (1.9s to transcribe): First, we stand up the new database schema alongside the old one, without touching any of the existing red paths.
+00:05:48 [36984.63] TRIGGER #127 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:05:58 [36994.18] SEGMENT (1.8s to transcribe): Second, we backfill the historical data in batches, probably overnight, so we don't hammer production during business hours.
+00:05:59 [36995.38] TRIGGER #128 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:06:11 [37007.33] SEGMENT (2.1s to transcribe): Third, once we've verified the backfill is complete and the checksums match, we cut over the right path and start dual-riding for a week before we retire the old table entirely.
+00:06:12 [37008.53] TRIGGER #129 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:06:28 [37022.29] SEGMENT (2.2s to transcribe): The biggest risk here is that backfill jobs silently dropping rows if the source table gets a schema change mid-migration, so I want someone watching the row counts the whole time, not just checking them at the end.
+00:06:29 [37022.59] CLIP_END en_normal.wav
+00:06:29 [37023.49] TRIGGER #130 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:06:32 [37025.60] CLIP_START en_fast.wav duration=16.4s
+00:06:33 [37027.34] HEARTBEAT segments=130 triggers=130 errors=0
+00:06:51 [37042.16] CLIP_END en_fast.wav
+00:06:55 [37046.13] SEGMENT (3.8s to transcribe): Okay quick update before we run out of time, the API gateway change went out this morning, latency dropped from about 200 milliseconds down to 80, error rate is flat, nothing on fire, but I did notice the retry logic is still using the old back-off curve so we should probably fix that before next week's traffic spike because right now a downstream failure could cause a thundering hurt, and separately the on-call rotation needs an update since two people are out next sprint, so, somebody please update the calendar today.
+00:06:56 [37047.34] TRIGGER #131 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:06:58 [37048.95] CLIP_START taglish.wav duration=35.5s
+00:07:04 [37055.76] SEGMENT (1.7s to transcribe): Okay so, Angplan Nathan is we need to finish young deliverable by Friday
+00:07:06 [37056.96] TRIGGER #132 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:07:12 [37063.62] SEGMENT (1.9s to transcribe): S.I. Maria will handle the back-end part, Taipo's S.I. John-Naman S.A. front-end.
+00:07:14 [37064.82] TRIGGER #133 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:07:20 [37071.62] SEGMENT (1.8s to transcribe): Me diotite young timeline pero que inadun 2, as long as we communicate clearly.
+00:07:22 [37072.83] TRIGGER #134 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:07:35 [37084.35] SEGMENT (2.0s to transcribe): Let's also make sure NA update Nathan Young documentation bag o mag deploy, Kossi last time nikolimutan nathan at nag cause NG confusion SAQA team
+00:07:37 [37085.55] TRIGGER #135 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:07:38 [37087.34] HEARTBEAT segments=135 triggers=135 errors=0
+00:07:45 [37093.63] SEGMENT (1.9s to transcribe): Anyway, Kong may concerns Kao, Sabahin Nyo Na Lang Agad, don't wait until the last minute.
+00:07:45 [37093.83] CLIP_END taglish.wav
+00:07:46 [37094.83] TRIGGER #136 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:07:48 [37096.84] CLIP_START zira_clip.wav duration=41.2s
+00:08:04 [37110.55] SEGMENT (2.3s to transcribe): When I joined the team, the biggest challenge was that our on-call rotation had no documented escalation path, so every incident turned into a scramble to find whoever happened to be awake.
+00:08:06 [37111.75] TRIGGER #137 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:08:12 [37118.50] SEGMENT (1.7s to transcribe): I spent the first two weeks just interviewing engineers and writing down what they already knew informally.
+00:08:14 [37119.70] TRIGGER #138 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:08:26 [37132.32] SEGMENT (2.3s to transcribe): Then I put together a runbook that mapped each alert to a specific owner and a specific set of first steps, and we ran two tabletop exercises to stress test it before relying on it for real.
+00:08:27 [37133.52] TRIGGER #139 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:08:42 [37146.46] SEGMENT (2.1s to transcribe): Within a month our mean time to acknowledge dropped by more than half, and just as importantly, people stopped dreading their on-call weeks because they finally had something concrete to follow instead of guessing.
+00:08:43 [37146.66] CLIP_END zira_clip.wav
+00:08:43 [37147.34] HEARTBEAT segments=140 triggers=139 errors=0
+00:08:44 [37147.66] TRIGGER #140 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:08:46 [37149.67] CLIP_START fast_long.wav duration=39.5s
+00:09:28 [37189.40] CLIP_END fast_long.wav
+00:09:28 [37189.40] IDLE_START duration=300s (simulating a quiet stretch of a real meeting)
+00:09:36 [37197.87] SEGMENT (8.2s to transcribe): Ok so quick context dump before the call ends because I know we're almost out of time, the deploy this morning went fine on the payment service but right after that we saw the checkout latency spike from around 90 milliseconds up to almost 450 milliseconds for about 6 minutes before it settled back down, and when we dug into the traces it looked like the connection pool to the inventory service was getting exhausted because a retry storm kicked in when one of it. 3 inventory replicas got slow, and the circuit breaker config we have right now waits way too long before it actually trips, something like 30 consecutive failures, so by the time it opened the damage was already done, and separately I noticed a feature flat rollout for the new pricing engine is still sitting at 10% even though the ticket said we should be at 50% by end of day yesterday, so somebody needs to bump that or tell me why it's intentionally paused, and... calculator suite that's been failing intermittently for like a week now and nobody has actually looked at the root cause yet, they just keep rerunning the pipeline until it goes green, which is obviously not a real fix, so I'd like to get that assigned to someone today if at all possible before it actually breaks something in production.
+00:09:38 [37199.07] TRIGGER #141 (pause elapsed with new content since the last trigger -- a real suggestion would fire now)
+00:09:48 [37207.34] HEARTBEAT segments=141 triggers=141 errors=0
+00:10:51 [37267.35] HEARTBEAT segments=141 triggers=141 errors=0
+00:11:56 [37327.35] HEARTBEAT segments=141 triggers=141 errors=0
+00:13:02 [37387.35] HEARTBEAT segments=141 triggers=141 errors=0
+00:14:07 [37447.35] HEARTBEAT segments=141 triggers=141 errors=0
+00:15:04 [37498.53] IDLE_END
+00:15:04 [37498.54] CYCLE_END #9 segments=16 empty=0 triggers=16 avg_transcribe_latency=2.46s
+00:15:06 [37500.24] HARNESS_SCHEDULE_DONE
+00:15:06 [37500.24] SUMMARY total_wall_clock_seconds=2993 (49.9 min)
+00:15:06 [37500.24] SUMMARY total_segments_with_text=141
+00:15:06 [37500.24] SUMMARY total_segments_empty=0
+00:15:06 [37500.24] SUMMARY total_triggers=141
+00:15:06 [37500.24] SUMMARY total_notifications_estimate=282 (SEGMENT + TRIGGER lines only -- what a live agent session actually reacts to; SEGMENT_EMPTY isn't sent to a real session in production either, see transcribe_segment_and_report's `if text:` guard in main.py)
+00:15:06 [37500.24] SUMMARY total_errors=0
+00:15:06 [37500.24] SUMMARY transcribe_latency_first_10_avg=2.14s
+00:15:06 [37500.24] SUMMARY transcribe_latency_last_10_avg=2.58s
+00:15:06 [37500.24] SUMMARY transcribe_latency_overall_avg=2.46s

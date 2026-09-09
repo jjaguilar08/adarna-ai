@@ -821,6 +821,30 @@ actually happened.
 
 </details>
 
+## Day 23 — Post-Meeting Summary Generation (Phase 3) ✅ implemented and live-verified
+
+Implemented as scoped below: `generate_summary`/`summary`/`summary_failed` added to the wire
+protocol, `wsl_app` generating the summary via a fresh one-shot `ClaudeCli` against a new shared
+`SUMMARY_SYSTEM_PROMPT`, and `windows_app` adding a Summary pane with Generate/Save Summary buttons
+sourced from `TranscriptDisplay.full_text()` — the full untrimmed session transcript, per this day's
+own design call, not `wsl_app`'s trimmed suggestion context. Full implementation detail in the
+collapsed original-scope section below (see its own 2026-09-09 update note).
+
+**Live-verified against a real transcript, end to end, in the real GUI:** Jon ran a real ~30-line
+transcript (a recorded team meeting — apologies, rotating minute-taker, multiple team-member status
+updates, a reviewed planning document tied to appraisals, a website launch update, several workshop-
+booking numbers with mixed attendance, and an any-other-business item), generated a summary from it,
+and confirmed **"the saved summary is good."** The generated KEY POINTS/DECISIONS/ACTION ITEMS
+correctly attributed items to the right people (Morgan/Amy/Charles), captured decisions genuinely
+made in the meeting (extra Project Management workshop session, revisiting low-booking workshops next
+week) rather than inventing any, and the action items list was complete against a meeting with several
+different owners — a good real-world confirmation of the Day 23 design call, since this transcript
+was long enough that a summary sourced from wsl_app's own trimmed rolling context (rather than
+windows_app's full transcript) would very likely have dropped its early content (apologies, the first
+few team updates). Closes out the one item flagged open in the 2026-09-09 update below.
+
+<details><summary>Original Day 23 scope (for reference)</summary>
+
 ## Day 23 — Post-Meeting Summary Generation (Phase 3)
 
 Scope per PRD §8 Phase 3: after a session ends, generate a written summary (key points, decisions,
@@ -874,3 +898,47 @@ exported to a local markdown/txt file that reads as a correct, complete record o
 Day 19's mic-noise-hallucination and transcribe-concurrency fixes, and Day 21's fast-speech
 segmentation change — are now resolved. Jon confirmed a real mic/loopback session works well, no
 issues reported. See Day 19 and Day 21 above.
+
+**Update, 2026-09-09 — implemented, partially live-verified:**
+
+- `wsl_app/main.py`: new `generate_summary` handler in `handle_client()` (session-independent —
+  windows_app normally sends this after a session has already ended and torn its own
+  `MeetingSession` down, so it can't reuse a session's `_claude_cli`). `generate_and_send_summary()`
+  spins up a fresh, one-shot `ClaudeCli` framed with a new shared `SUMMARY_SYSTEM_PROMPT` (one
+  prompt for both modes, not per-mode — key points/decisions/action items fits either a meeting or
+  an interview well enough that a second near-duplicate prompt didn't seem worth it), asks it with
+  whatever transcript text windows_app sent, stops the process again, and replies with a `summary`
+  message (or `summary_failed` with a reason — including an explicit empty-transcript guard, tested
+  below). Guarded by a per-connection `summary_lock` so two rapid requests can't run two summary CLI
+  processes at once.
+- `windows_app/main.py`: `TranscriptDisplay.full_text()` returns the full, untrimmed, source-labeled
+  session transcript (the actual per-Day-23-design-call data source — never wsl_app's trimmed
+  `recent_transcript_segments`). New `SummaryDisplay` (a `QObject`, bound-method slots per this
+  file's established cross-thread-signal rule) plus `create_summary_section()`/
+  `create_summary_controls()` add a Summary pane with "Generate Summary" (disabled during an active
+  session and while a request is in flight; also self-heals if the connection drops mid-request, so
+  it can't get stuck disabled) and "Save Summary" (a plain one-shot `QFileDialog` + file write,
+  defaulting into `SESSIONS_DIR` with a timestamped `.md` name — no `SessionRecorder` involvement,
+  matching the design call that a summary doesn't need incremental-append machinery).
+- **Live-verified (wsl_app side only):** ran `ClaudeCli`/`SUMMARY_SYSTEM_PROMPT` directly against the
+  real `claude` CLI with two varied fabricated transcripts — one with a real decision + owned action
+  items + a technical tangent + a garbled ASR-noise line, one with no decisions/action items at all
+  (to exercise the "None recorded." fallback) — both read as accurate, complete summaries of their
+  input, the garbled line was silently ignored rather than commented on, and the fallback branch
+  fired correctly. Separately ran the actual wire protocol end-to-end (a real `handle_client()`
+  instance on an isolated port, not the shared 8765 one — the user had a real windows_app session
+  actively connected there at the time, so that instance was deliberately left untouched): a real
+  `generate_summary` message produced a correct `summary` reply, and a `generate_summary` with an
+  empty transcript correctly produced `summary_failed` instead of spawning a CLI process for nothing.
+- **Not yet live-verified (needs a real Windows run, per this project's own established gap for
+  anything GUI/OS-level — see the hotkey and combo-box entries above):** the actual Generate
+  Summary/Save Summary buttons, the summary pane rendering, and opening the saved file to confirm
+  it's a complete, readable record — none of this can be exercised from WSL (no PySide6 display, no
+  `pyaudiowpatch`, no real session to produce a real full transcript). Needs a real session run
+  end-to-end on Windows before this day is fully done-when-criteria-complete.
+
+**Update, 2026-09-09 (later same day):** the item above is now resolved — see the live-verification
+note at the top of this Day 23 section. Jon ran a real transcript through Generate Summary and Save
+Summary in the actual GUI and confirmed the saved file was good.
+
+</details>

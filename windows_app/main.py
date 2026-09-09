@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -169,13 +170,15 @@ class WslConnection(QObject):
     for the full set of message types this protocol carries: ping/pong,
     audio_chunk, session_started/session_stopped, session_start_failed,
     hotkey_triggered, settings_changed, auto_suggest_changed, transcript,
-    and suggestion.
+    suggestion, generate_summary, summary, and summary_failed.
     """
 
     connection_changed = Signal(bool)
     transcript_received = Signal(str, str, float)  # source, text, started_at
     suggestion_received = Signal(str, str)
     session_start_failed_received = Signal(str, int)
+    summary_received = Signal(str)
+    summary_failed_received = Signal(str)
 
     def __init__(self):
         """Sets up the (initially disconnected) state shared across threads."""
@@ -250,7 +253,9 @@ class WslConnection(QObject):
         attempt_id is the same value sent on the session_started message
         it's responding to, echoed back so the UI can tell a stale failure
         (for an attempt already abandoned in favor of a newer one) from a
-        current one.
+        current one. summary/summary_failed (Day 23) are forwarded the same
+        defensive way as suggestion's "question" field above, in case a
+        field is ever missing or explicitly null.
         """
         while True:
             line = self._connection.readline()
@@ -267,6 +272,10 @@ class WslConnection(QObject):
                 self.session_start_failed_received.emit(
                     message.get("reason", "Unknown error"), message.get("attempt_id", -1)
                 )
+            elif message.get("type") == "summary":
+                self.summary_received.emit(message.get("text") or "")
+            elif message.get("type") == "summary_failed":
+                self.summary_failed_received.emit(message.get("reason") or "Unknown error")
 
     def send_message(self, message):
         """
@@ -614,6 +623,28 @@ def create_capture_status_label(layout):
     return label
 
 
+def create_mic_toggle_checkbox(layout):
+    """
+    Adds a "Mic enabled" checkbox, checked by default -- lets the user mute
+    their own mic mid-session (e.g. someone else's TV/conversation bleeding
+    into a real mic's noise floor) without stopping the whole session, the
+    way Stop Session would. Only meaningful for the mic source -- loopback
+    has no equivalent real-world noise problem to mute around, so there's
+    no matching checkbox for it. Applies live, immediately, like the
+    overlay's click-through checkbox (see create_overlay_controls()) rather
+    than being read once at Start Session like the rest of "Session
+    Settings" -- see create_session_controls(), which wires this up and
+    also reads its starting state when a session begins.
+
+    Returns:
+        QCheckBox: the checkbox to wire up.
+    """
+    checkbox = QCheckBox("Mic enabled")
+    checkbox.setChecked(True)
+    layout.addWidget(checkbox)
+    return checkbox
+
+
 def create_session_buttons(layout):
     """
     Adds side-by-side "Start Session" / "Stop Session" buttons. Stop
@@ -722,6 +753,22 @@ class TranscriptDisplay(QObject):
         self._segments = []
         self._render()
 
+    def full_text(self):
+        """
+        Returns:
+            str: every segment transcribed so far this session, one
+            source-labeled line per segment (e.g. "You: ...", "Them: ...",
+            same shape as _render()'s pane text), in chronological order --
+            the full, untrimmed record generate_summary sends to wsl_app
+            (Day 23, see docs/DEV_PLAN.md), as opposed to wsl_app's own
+            MeetingSession.recent_transcript_segments, which is a bounded
+            rolling window sized for live suggestion context, not a full-
+            session record. Empty string if nothing's been transcribed yet.
+        """
+        return "\n".join(
+            f"{TRANSCRIPT_SOURCE_LABELS[source]}: {text}" for _started_at, source, text in self._segments
+        )
+
     def _render(self):
         """
         Rewrites the pane's full text from the segment list, one labeled
@@ -797,6 +844,55 @@ class SuggestionDisplay(QObject):
         self._suggestions_pane.setPlainText(answer)
         self._latest_suggestion.update(answer)
         self._overlay_window.update_suggestion(question, answer)
+
+
+class SummaryDisplay(QObject):
+    """
+    Keeps the summary pane, the Generate Summary button, and the Save
+    Summary button in sync with wsl_app's summary/summary_failed messages
+    (Day 23, PRD §8 Phase 3). A QObject with real bound methods (update()/
+    handle_failed()), not lambdas, for the same cross-thread reason as
+    TranscriptDisplay/SuggestionDisplay above -- summary_received and
+    summary_failed_received are emitted from WslConnection's background
+    reader thread (see OverlayToggle.toggle for the fuller explanation of
+    that rule).
+
+    Generate Summary's own enabled/disabled state as a function of session
+    status (no session running yet, or nothing transcribed) is owned by
+    create_session_controls(), not here -- this class only re-enables it
+    once a request it disabled (see create_summary_controls()) has actually
+    finished, one way or another.
+    """
+
+    def __init__(self, pane, generate_button, save_button):
+        """Stores the widgets to keep in sync, starting with no summary generated yet."""
+        super().__init__()
+        self._pane = pane
+        self._generate_button = generate_button
+        self._save_button = save_button
+        self.text = ""
+
+    def update(self, text):
+        """Shows a newly generated summary, enables Save Summary, and re-enables Generate Summary now that this request has finished."""
+        self.text = text
+        self._pane.setPlainText(text)
+        self._save_button.setEnabled(True)
+        self._generate_button.setEnabled(True)
+
+    def handle_failed(self, reason):
+        """Reports a summary generation that failed on the wsl_app side (e.g. the claude CLI process couldn't start), and re-enables Generate Summary so the user can retry."""
+        self._generate_button.setEnabled(True)
+        QMessageBox.warning(self._pane, "Summary Failed", reason)
+
+    def reset(self):
+        """
+        Clears the summary pane and text and disables Save Summary -- call
+        when a new session starts, so a previous session's summary doesn't
+        linger and look like it belongs to the new one.
+        """
+        self.text = ""
+        self._pane.clear()
+        self._save_button.setEnabled(False)
 
 
 class SessionRecorder(QObject):
@@ -1356,6 +1452,36 @@ def create_suggestions_section(layout):
     return pane, latest_suggestion
 
 
+def create_summary_section(layout):
+    """
+    Adds a labeled, read-only pane that shows the post-meeting summary once
+    generated (Day 23, PRD §8 Phase 3), plus "Generate Summary" and "Save
+    Summary" buttons. Both start disabled: Generate Summary has nothing to
+    summarize until a session has actually run and ended (see
+    create_session_controls(), which owns enabling/disabling it based on
+    session state), and Save Summary has nothing to save until a summary
+    has actually arrived (see SummaryDisplay.update()).
+
+    Returns:
+        tuple[QPlainTextEdit, QPushButton, QPushButton]: the pane summary
+        text is shown in, the Generate Summary button, and the Save
+        Summary button.
+    """
+    layout.addWidget(QLabel("Summary"))
+    pane = create_readonly_text_pane(layout)
+
+    row = QHBoxLayout()
+    generate_button = QPushButton("Generate Summary")
+    generate_button.setEnabled(False)
+    save_button = QPushButton("Save Summary")
+    save_button.setEnabled(False)
+    row.addWidget(generate_button)
+    row.addWidget(save_button)
+    layout.addLayout(row)
+
+    return pane, generate_button, save_button
+
+
 def create_session_recorder():
     """
     Creates the SessionRecorder that optionally saves a session's transcript
@@ -1392,6 +1518,71 @@ def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_windo
         its update() method (see connect_incoming_messages_to_ui()).
     """
     return SuggestionDisplay(suggestions_pane, latest_suggestion, overlay_window)
+
+
+def create_summary_display(summary_pane, generate_button, save_button):
+    """
+    Creates the SummaryDisplay that keeps summary_pane and the Generate/Save
+    Summary buttons in sync with wsl_app's summary/summary_failed messages.
+
+    Returns:
+        SummaryDisplay: connect wsl_connection.summary_received to its
+        update() method, and summary_failed_received to handle_failed()
+        (see connect_incoming_messages_to_ui()).
+    """
+    return SummaryDisplay(summary_pane, generate_button, save_button)
+
+
+def create_summary_controls(wsl_connection, transcript_display, summary_display, generate_button, save_button, window):
+    """
+    Wires the Generate Summary and Save Summary buttons.
+
+    Generate sends wsl_app the full in-session transcript (see
+    TranscriptDisplay.full_text -- the whole session, not wsl_app's own
+    trimmed rolling suggestion context, see docs/DEV_PLAN.md Day 23) as a
+    generate_summary message, and disables itself until SummaryDisplay
+    reports the request has finished (summary or summary_failed -- see
+    SummaryDisplay.update()/handle_failed()), so two rapid clicks can't fire
+    two overlapping requests. If the wsl_app connection drops while a
+    request is in flight, summary/summary_failed will never arrive to
+    re-enable it on its own, so this also re-enables it on disconnect
+    (rather than leaving the button stuck disabled) whenever there's still
+    a transcript to retry with.
+
+    Save opens a file dialog and writes whatever text is currently in the
+    summary pane to disk in one shot (Day 23) -- unlike SessionRecorder's
+    live-append transcript recording, a summary is generated once, in full,
+    so a plain single write is enough; no need to route it through
+    SessionRecorder's incremental-flush machinery.
+    """
+
+    def generate_summary():
+        """Sends wsl_app the full transcript and asks it to generate a summary, disabling the button until a response arrives."""
+        generate_button.setEnabled(False)
+        wsl_connection.send_message({"type": "generate_summary", "transcript": transcript_display.full_text()})
+
+    def save_summary():
+        """Opens a save dialog and writes the current summary text to the chosen file."""
+        if not summary_display.text:
+            return
+        default_name = f"summary_{time.strftime('%Y-%m-%d_%H%M%S')}.md"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            window, "Save Summary", str(SESSIONS_DIR / default_name), "Markdown/Text Files (*.md *.txt);;All Files (*)"
+        )
+        if not path:
+            return
+        Path(path).write_text(summary_display.text, encoding="utf-8")
+
+    def handle_connection_dropped_while_generating(connected):
+        """Re-enables Generate Summary if the connection drops while a request might be in flight, so the user isn't stuck unable to retry."""
+        if connected or generate_button.isEnabled():
+            return
+        if transcript_display.full_text():
+            generate_button.setEnabled(True)
+
+    generate_button.clicked.connect(generate_summary)
+    save_button.clicked.connect(save_summary)
+    wsl_connection.connection_changed.connect(handle_connection_dropped_while_generating)
 
 
 def create_suggestion_trigger_controls(layout):
@@ -1582,16 +1773,20 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
     )
 
 
-def connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display):
+def connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display, summary_display):
     """
-    Wires wsl_app's incoming transcript/suggestion messages to the UI: each
-    transcript message appends one finished sentence to the transcript pane
-    via transcript_display (see TranscriptDisplay), and each suggestion is
-    fanned out by suggestion_display to the main pane, the Copy button's
-    tracker, and the overlay's question/answer labels (see SuggestionDisplay).
+    Wires wsl_app's incoming transcript/suggestion/summary messages to the
+    UI: each transcript message appends one finished sentence to the
+    transcript pane via transcript_display (see TranscriptDisplay), each
+    suggestion is fanned out by suggestion_display to the main pane, the
+    Copy button's tracker, and the overlay's question/answer labels (see
+    SuggestionDisplay), and each summary (or summary_failed) is handled by
+    summary_display (Day 23, see SummaryDisplay).
     """
     wsl_connection.transcript_received.connect(transcript_display.update)
     wsl_connection.suggestion_received.connect(suggestion_display.update)
+    wsl_connection.summary_received.connect(summary_display.update)
+    wsl_connection.summary_failed_received.connect(summary_display.handle_failed)
 
 
 def start_wsl_connection(status_label):
@@ -1717,6 +1912,8 @@ def create_audio_capture_manager(audio, wsl_connection, source, device_dropdown,
 def create_session_controls(
     wsl_connection,
     capture_managers,
+    mic_capture_manager,
+    mic_enabled_checkbox,
     mode_dropdown,
     pause_dropdown,
     context_notes_edit,
@@ -1724,6 +1921,8 @@ def create_session_controls(
     save_transcript_checkbox,
     session_recorder,
     transcript_display,
+    summary_display,
+    generate_summary_button,
     layout,
     window,
 ):
@@ -1755,6 +1954,24 @@ def create_session_controls(
     device disappeared or changed) — either one ends the whole session,
     since a suggestion built from only one side of the conversation for
     the rest of it isn't something to silently fall back to.
+
+    Also owns Generate Summary's enabled state (Day 23): starting a session
+    disables it and clears any leftover summary from a previous session
+    (see summary_display.reset()), since there's no complete transcript to
+    summarize yet; every way a session can end enables it again, but only
+    if the session actually produced a transcript worth summarizing.
+
+    Also reads mic_enabled_checkbox's starting state when a session begins
+    (Day 24) -- mic capture is skipped entirely at Start Session if it's
+    already unchecked -- and wires it to mute/unmute mic capture live for
+    the rest of the session (see handle_mic_enabled_toggled()), so
+    background noise picked up on a real mic (e.g. someone else's TV) can
+    be muted out without stopping the whole session. `mic_capture_manager`/
+    `mic_enabled_checkbox` are both None on a machine with no usable
+    microphone (see main()'s get_default_mic_device() branch) -- every
+    mic-toggle code path here is a no-op in that case, the same defensive
+    shape create_audio_capture_manager()'s own optional mic branch already
+    uses.
     """
     start_button, stop_button = create_session_buttons(layout)
     current_attempt_id = 0
@@ -1778,7 +1995,10 @@ def create_session_controls(
         no-op on a manager that isn't currently capturing, so there's no
         need to track which manager, if any, already stopped.
         session_recorder.stop() is likewise called unconditionally — a
-        safe no-op if this session was never being recorded.
+        safe no-op if this session was never being recorded. Generate
+        Summary (Day 23) is enabled here only if there's actually a
+        transcript to summarize — a session that failed to start, or ended
+        before anything was ever transcribed, leaves it disabled.
         """
         if notify_wsl_app:
             wsl_connection.send_message({"type": "session_stopped"})
@@ -1787,17 +2007,27 @@ def create_session_controls(
         session_recorder.stop()
         window.setWindowTitle(DEFAULT_WINDOW_TITLE)
         revert_to_pre_session_state()
+        generate_summary_button.setEnabled(bool(transcript_display.full_text()))
 
     def start_session():
-        """Begins a session: clears the transcript pane, sends the current settings, notifies wsl_app, starts capture on every source, starts session_recorder if the user opted in, and flips button state."""
+        """Begins a session: clears the transcript pane and any previous summary, sends the current settings, notifies wsl_app, starts capture on every source (skipping the mic if Mic Enabled is already unchecked), starts session_recorder if the user opted in, and flips button state."""
         nonlocal current_attempt_id
         current_attempt_id += 1
         transcript_display.reset()
+        summary_display.reset()
+        generate_summary_button.setEnabled(False)
         wsl_connection.send_message(
             current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox)
         )
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
+        mic_starts_muted = (
+            mic_capture_manager is not None
+            and mic_enabled_checkbox is not None
+            and not mic_enabled_checkbox.isChecked()
+        )
         for capture_manager in capture_managers:
+            if capture_manager is mic_capture_manager and mic_starts_muted:
+                continue
             capture_manager.start_capture()
         if save_transcript_checkbox.isChecked():
             session_recorder.start(mode_dropdown.currentText())
@@ -1852,12 +2082,30 @@ def create_session_controls(
             return
         end_session(notify_wsl_app=True)
 
+    def handle_mic_enabled_toggled(enabled):
+        """
+        Mutes or unmutes mic capture live (Day 24), the moment the
+        checkbox is flipped, if a session is currently running -- a safe
+        no-op otherwise (there's no capture to start/stop yet; start_session()
+        reads the checkbox's current state itself when the next session
+        begins, see above). A no-op on a machine with no usable microphone
+        too, where mic_capture_manager is None.
+        """
+        if mic_capture_manager is None or not stop_button.isEnabled():
+            return
+        if enabled:
+            mic_capture_manager.start_capture()
+        else:
+            mic_capture_manager.stop_capture()
+
     start_button.clicked.connect(start_session)
     stop_button.clicked.connect(stop_session)
     wsl_connection.session_start_failed_received.connect(handle_session_start_failed)
     wsl_connection.connection_changed.connect(handle_connection_changed)
     for capture_manager in capture_managers:
         capture_manager.capture_failed.connect(handle_capture_failed)
+    if mic_enabled_checkbox is not None:
+        mic_enabled_checkbox.toggled.connect(handle_mic_enabled_toggled)
 
 
 def main():
@@ -1868,13 +2116,15 @@ def main():
     user's own microphone -- each with its own device picker and capture
     status label, each its own independent AudioCaptureManager; mic
     capture is skipped entirely, loopback-only, on a machine with no
-    usable microphone -- see get_default_mic_device()), the
+    usable microphone -- see get_default_mic_device()) including the live
+    Mic Enabled mute toggle (Day 24, see create_mic_toggle_checkbox), the
     settings panel (including the opt-in "save transcript to a file"
     checkbox -- Day 22, see SessionRecorder), the overlay opacity/
     click-through controls, the auto-suggest toggle and manual trigger
-    button, the session start/stop controls, and the global
-    suggestion-trigger and overlay show/hide hotkeys, and runs the event
-    loop until the main window is closed.
+    button, the session start/stop controls, the post-meeting summary
+    controls (Day 23, see SummaryDisplay/create_summary_controls), and the
+    global suggestion-trigger and overlay show/hide hotkeys, and runs the
+    event loop until the main window is closed.
 
     The main window's suggestion pane stays answer-only (Day 18): the
     overlay is the one place the question/answer excerpt pairing actually
@@ -1891,6 +2141,7 @@ def main():
     loopback_capture_status_label = create_capture_status_label(layout)
     mic_device_dropdown = create_device_dropdown(layout, "Microphone device (your own voice, i.e. \"You\"):")
     mic_capture_status_label = create_capture_status_label(layout)
+    mic_enabled_checkbox = create_mic_toggle_checkbox(layout)
     mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox = create_settings_panel(layout)
     overlay_window = create_overlay_window()
     create_overlay_controls(layout, overlay_window)
@@ -1899,6 +2150,8 @@ def main():
     transcript_display = create_transcript_display(transcript_pane)
     suggestions_pane, latest_suggestion = create_suggestions_section(layout)
     suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
+    summary_pane, generate_summary_button, save_summary_button = create_summary_section(layout)
+    summary_display = create_summary_display(summary_pane, generate_summary_button, save_summary_button)
     session_recorder = create_session_recorder()
 
     audio = pyaudio.PyAudio()
@@ -1916,9 +2169,10 @@ def main():
         # isn't available, not silently missing.
         mic_device_dropdown.setEnabled(False)
         mic_capture_status_label.setText("No microphone available")
+        mic_enabled_checkbox.setEnabled(False)
 
     wsl_connection = start_wsl_connection(status_label)
-    connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display)
+    connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display, summary_display)
     connect_session_recorder(wsl_connection, session_recorder)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     loopback_capture_manager = create_audio_capture_manager(
@@ -1926,6 +2180,7 @@ def main():
         loopback_capture_status_label,
     )
     capture_managers = [loopback_capture_manager]
+    mic_capture_manager = None
     if default_mic_device is not None:
         mic_capture_manager = create_audio_capture_manager(
             audio, wsl_connection, AUDIO_SOURCE_MIC, mic_device_dropdown, default_mic_device, mic_capture_status_label
@@ -1934,6 +2189,8 @@ def main():
     create_session_controls(
         wsl_connection,
         capture_managers,
+        mic_capture_manager,
+        mic_enabled_checkbox,
         mode_dropdown,
         pause_dropdown,
         context_notes_edit,
@@ -1941,8 +2198,13 @@ def main():
         save_transcript_checkbox,
         session_recorder,
         transcript_display,
+        summary_display,
+        generate_summary_button,
         layout,
         window,
+    )
+    create_summary_controls(
+        wsl_connection, transcript_display, summary_display, generate_summary_button, save_summary_button, window
     )
     # Kept referenced for the app's lifetime -- see start_global_hotkeys()'s docstring.
     request_suggestion_now = create_manual_suggestion_trigger(wsl_connection)

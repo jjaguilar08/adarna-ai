@@ -745,12 +745,22 @@ async def handle_client(model_manager, reader, writer):
     message is sent back instead of just dropping the connection, so
     windows_app can revert its UI to a clean pre-session state rather than
     getting stuck showing a session as active.
+
+    generate_summary (Day 23) is the one message type here that's NOT
+    session-scoped -- handled the same way regardless of whether `session`
+    is currently set, since windows_app normally sends it after a session
+    has already ended (see generate_and_send_summary()).
     """
     peer = writer.get_extra_info("peername")
     print(f"Client connected: {peer}")
     audio_trackers = {source: AudioLevelTracker(source) for source in AUDIO_SOURCES}
     session = None
     pending_settings = None
+    # Guards generate_and_send_summary() -- see its docstring. One per
+    # connection, independent of `session`: a summary is normally requested
+    # after a session has already ended (and torn its own session down), so
+    # this can't just reuse a session's own _claude_cli_lock.
+    summary_lock = asyncio.Lock()
     try:
         while True:
             line = await reader.readline()
@@ -816,6 +826,10 @@ async def handle_client(model_manager, reader, writer):
             elif message_type == "auto_suggest_changed":
                 if session is not None:
                     session.set_auto_suggest_enabled(bool(message.get("enabled", False)))
+            elif message_type == "generate_summary":
+                asyncio.create_task(
+                    generate_and_send_summary(writer, message.get("transcript", ""), summary_lock)
+                )
             else:
                 reply = await build_reply(message)
                 if reply is not None:
@@ -1037,6 +1051,46 @@ SYSTEM_PROMPT_BY_MODE = {
     "meeting": MEETING_SYSTEM_PROMPT,
     "interview": INTERVIEW_SYSTEM_PROMPT,
 }
+
+# Framing for a post-meeting summary (Day 23, PRD §8 Phase 3) -- one shared
+# prompt for both modes rather than per-mode (MEETING_SYSTEM_PROMPT/
+# INTERVIEW_SYSTEM_PROMPT), since key points/decisions/action items are a
+# sensible shape for either a work meeting or an interview and the scope
+# here doesn't call for two near-duplicate prompts. Unlike a suggestion,
+# there's no strict "one skimmable line" or "renderable bullet markup"
+# constraint from a Qt overlay -- the summary is read in its own pane and
+# exported to a plain-text/markdown file -- but the literal "- " bullets
+# and no-markdown-headers rule are kept anyway, matching this project's
+# established, already-verified-renderable shape (see
+# RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION) rather than inventing a new
+# one just for this.
+SUMMARY_SYSTEM_PROMPT = (
+    "You are generating a written summary of a work meeting or job "
+    "interview that just finished, from its full transcript below. The "
+    "transcript is real-time automatic speech-to-text, labeled by who's "
+    "speaking (\"You\" is the user, \"Them\" is everyone else) -- it will "
+    "sometimes contain misheard words or garbled fragments; silently work "
+    "around anything that looks like a transcription error rather than "
+    "commenting on it.\n\n"
+    "Respond in plain text only -- no markdown headers, bold, or numbered "
+    "lists -- using exactly these three section labels, each on its own "
+    "line, in this order:\n\n"
+    "KEY POINTS\n"
+    "3-8 bullet points, each on its own line starting with \"- \", "
+    "covering the main topics actually discussed.\n\n"
+    "DECISIONS\n"
+    "Bullet points in the same \"- \" shape for anything the conversation "
+    "actually settled or agreed on. If nothing was decided, write a "
+    "single bullet: \"- None recorded.\"\n\n"
+    "ACTION ITEMS\n"
+    "Bullet points in the same \"- \" shape for concrete next steps or "
+    "follow-ups mentioned, naming who owns each one if that was said. If "
+    "none were mentioned, write a single bullet: \"- None recorded.\"\n\n"
+    "One point per line, no sub-bullets. Base every bullet only on what's "
+    "actually in the transcript below -- never invent a point, decision, "
+    "or action item that wasn't really said, and never comment on "
+    "transcript quality or transcription errors in the summary itself."
+)
 
 
 def build_system_prompt(mode, context_notes):
@@ -1555,6 +1609,61 @@ class MeetingSession:
         self.trigger.stop()
         async with self._claude_cli_lock:
             await asyncio.to_thread(self._claude_cli.stop)
+
+
+async def generate_and_send_summary(writer, transcript_text, summary_lock):
+    """
+    Generates a post-meeting summary (key points/decisions/action items,
+    see SUMMARY_SYSTEM_PROMPT) from `transcript_text` and sends it back as a
+    "summary" message -- or a "summary_failed" message, with a reason, if
+    it couldn't be generated. `transcript_text` is windows_app's own full,
+    untrimmed in-session transcript (TranscriptDisplay), sent on the
+    generate_summary message -- deliberately not this connection's
+    MeetingSession.recent_transcript_segments, which is a bounded rolling
+    window sized for live suggestion context and would silently summarize
+    only the last few minutes of a real meeting (see docs/DEV_PLAN.md, Day
+    23).
+
+    Spins up a fresh, one-shot ClaudeCli scoped to SUMMARY_SYSTEM_PROMPT
+    rather than reusing a session's own ClaudeCli: by the time a session
+    has actually ended (see MeetingSession.close()), its own claude CLI
+    process -- framed by that session's mode, not a summary -- is already
+    stopped, so there's no still-running, session-scoped process left to
+    reuse here anyway. Stopped again once the summary is back, since this
+    process is only ever used for this one call.
+
+    `summary_lock` (one per connection, created in handle_client) guards
+    against two rapid generate_summary requests on the same connection
+    running two summary CLI processes at once -- skipped (silently, not
+    queued) if one is already in flight, since a second click while the
+    first is still generating would just be a duplicate request for the
+    same transcript.
+    """
+    if summary_lock.locked():
+        return
+    async with summary_lock:
+        if not transcript_text.strip():
+            await send_message(writer, {"type": "summary_failed", "reason": "Transcript is empty."})
+            return
+        claude_cli = ClaudeCli(SUMMARY_SYSTEM_PROMPT)
+        try:
+            summary_text = await asyncio.to_thread(claude_cli.ask, transcript_text)
+        except RuntimeError as error:
+            print(f"Couldn't generate summary: {error}")
+            await send_message(writer, {"type": "summary_failed", "reason": str(error)})
+            summary_text = None
+        try:
+            await asyncio.to_thread(claude_cli.stop)
+        except Exception as error:
+            # The process is already dead or misbehaving -- nothing to do
+            # about that, and it must not stop the summary (if any) from
+            # still being sent below.
+            print(f"Error stopping summary claude CLI process (ignoring): {error}")
+        if summary_text is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] Summary generated ({len(summary_text)} chars)")
+        await send_message(writer, {"type": "summary", "text": summary_text})
 
 
 def main():
