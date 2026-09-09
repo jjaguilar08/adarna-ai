@@ -11,7 +11,7 @@ from pathlib import Path
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QTextBlockFormat
+from PySide6.QtGui import QColor, QPainter, QPen, QTextBlockFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -107,12 +107,20 @@ DEFAULT_SUGGESTION_PAUSE_SECONDS = SUGGESTION_PAUSE_PRESETS_SECONDS[1]
 
 # Overlay visual redesign (Day 18), styled to match reference screenshots
 # of a real ParakeetAI-style overlay: a black, semi-transparent, rounded
-# panel with bold white text, and static 💬/⭐️ markers (not model output)
-# in place of "QUESTION"/"SUGGESTED RESPONSE" captions. Colors/spacing are
-# a by-eye match for "the same feel," not a pixel-exact clone.
-OVERLAY_BACKGROUND_COLOR = "rgba(0, 0, 0, 200)"
-OVERLAY_BORDER_COLOR = "rgba(255, 255, 255, 30)"
-OVERLAY_QUESTION_MARKER = "\U0001F4AC"  # 💬
+# panel with bold white text, and a static ⭐️ marker (not model output) in
+# place of a "SUGGESTED RESPONSE" caption. Colors/spacing are a by-eye
+# match for "the same feel," not a pixel-exact clone.
+#
+# Day 27: these are now plain (R, G, B, A) tuples, not CSS rgba() strings --
+# OverlayWindow paints its own background directly in paintEvent() instead
+# of through a QSS stylesheet (see that class's docstring for why: the
+# stylesheet-declared background never actually rendered on the real
+# Windows machine, confirmed live -- the panel was fully see-through at
+# every opacity setting, only the text visibly responded to the opacity
+# slider). The alpha values here are the panel's own base transparency;
+# OVERLAY_OPACITY_* below scales them further via the slider.
+OVERLAY_BACKGROUND_RGBA = (0, 0, 0, 200)
+OVERLAY_BORDER_RGBA = (255, 255, 255, 30)
 OVERLAY_ANSWER_MARKER = "⭐️"  # ⭐️
 OVERLAY_TEXT_COLOR = "#FFFFFF"
 
@@ -822,15 +830,17 @@ class LatestSuggestion(QObject):
 
 class SuggestionDisplay(QObject):
     """
-    Fans out one incoming suggestion to everywhere it's shown: the main
-    window's pane and the Copy button's tracker get the answer text only
-    (see main()'s docstring for why the question stays overlay-only), while
-    the overlay gets both the question and the answer, rendered in its
-    separate labels (Day 18 -- see OverlayWindow.update_suggestion). A
-    QObject with a bound-method slot, not a lambda, for the same
-    cross-thread reason as LatestSuggestion above: suggestion_received is
-    emitted from WslConnection's background reader thread, and a lambda has
-    no owning QObject for Qt to marshal the call through safely (see
+    Fans out one incoming suggestion to everywhere it's shown: the
+    Suggestions window's pane, the Copy button's tracker, and the overlay
+    (Day 27: answer-only now, see OverlayWindow.update_suggestion -- the
+    transcript-excerpt "question" this class still receives on every
+    update is no longer displayed anywhere; kept in the method signature
+    only because it still arrives on the same suggestion_received signal
+    other consumers, e.g. SessionRecorder, still use). A QObject with a
+    bound-method slot, not a lambda, for the same cross-thread reason as
+    LatestSuggestion above: suggestion_received is emitted from
+    WslConnection's background reader thread, and a lambda has no owning
+    QObject for Qt to marshal the call through safely (see
     OverlayToggle.toggle for the fuller explanation of that rule).
     """
 
@@ -842,10 +852,10 @@ class SuggestionDisplay(QObject):
         self._overlay_window = overlay_window
 
     def update(self, question, answer):
-        """Updates the main pane and Copy-button tracker with the answer, and the overlay with both the question and the answer."""
+        """Updates the Suggestions window's pane and Copy-button tracker, and the overlay, all with the answer text -- question is unused, see class docstring."""
         self._suggestions_pane.setPlainText(answer)
         self._latest_suggestion.update(answer)
-        self._overlay_window.update_suggestion(question, answer)
+        self._overlay_window.update_suggestion(answer)
 
 
 class SummaryDisplay(QObject):
@@ -1060,22 +1070,36 @@ class _DragHandle(QWidget):
 class OverlayWindow(QWidget):
     """
     The always-on-top overlay: frameless, stays above other windows, and
-    shows the transcript excerpt that prompted the latest suggestion
-    (the "question") above the suggestion itself (the "answer") -- per
-    PRD §8 Phase 2's Day 18 visual redesign: a black, semi-transparent,
-    rounded panel with bold white text and static 💬/⭐️ markers (no
-    transcript, no settings, no session controls -- those all stay on the
-    main window). Starts hidden; create_overlay_toggle() wires up the
-    hotkey that shows it. Dragged only via the _DragHandle strip docked at
-    its top (see that class's docstring for why); its question/answer body
-    is a plain, un-hacked QScrollArea.
+    shows the latest suggested answer -- per PRD §8 Phase 2's Day 18 visual
+    redesign, continued Day 27: a black, semi-transparent, rounded panel
+    with bold white text and a static ⭐️ marker (no transcript excerpt/
+    "question" any more -- dropped per direct user feedback that it was
+    just noise once you're glancing at this live during a call; no
+    settings, no session controls either -- those all stay on the main
+    window). Starts hidden; create_overlay_toggle() wires up the hotkey
+    that shows it. Dragged only via the _DragHandle strip docked at its
+    top (see that class's docstring for why); its body is a plain,
+    un-hacked QScrollArea.
 
     A real class (not a plain QWidget built by a factory function, like
     every other widget in this file) because dragging and the rounded/
     translucent look both need virtual methods overridden
-    (mousePressEvent/mouseMoveEvent/mouseReleaseEvent, paintEvent's
-    stylesheet painting) -- Qt's normal way of doing this is a subclass,
-    not event wiring bolted onto a generic QWidget.
+    (mousePressEvent/mouseMoveEvent/mouseReleaseEvent, paintEvent) -- Qt's
+    normal way of doing this is a subclass, not event wiring bolted onto a
+    generic QWidget.
+
+    Day 27: the rounded black panel is now painted directly in
+    paintEvent() (see that method) instead of through a QSS stylesheet +
+    WA_StyledBackground -- confirmed live on the real Windows machine that
+    the stylesheet approach, despite being the textbook-documented way to
+    give a plain QWidget a styled background, never actually painted
+    anything: the panel was fully see-through at every opacity setting,
+    with only the text responding to the slider. Rather than keep
+    debugging exactly which of three interacting mechanisms (QSS,
+    WA_StyledBackground, setWindowOpacity()) was misbehaving on this
+    machine without being able to see it directly, this removes all three
+    in favor of one direct, fully-controlled QPainter fill -- see
+    paintEvent() and set_opacity().
 
     WA_QuitOnClose is turned off specifically so this window doesn't
     count toward Qt's "quit once every counted window is closed" check --
@@ -1085,28 +1109,26 @@ class OverlayWindow(QWidget):
     """
 
     def __init__(self):
-        """Builds the frameless, translucent, rounded overlay panel and its question/answer labels, starting hidden with no drag in progress."""
+        """Builds the frameless, translucent, rounded overlay panel and its answer label, starting hidden with no drag in progress."""
         super().__init__()
         self.setWindowTitle("Adarna Overlay")
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_QuitOnClose, False)
-        # Both needed together for a rounded, see-through-cornered panel:
-        # WA_TranslucentBackground makes the whole window surface support
-        # alpha (so the corners outside the rounded rect are truly
-        # see-through, not just black); WA_StyledBackground makes a plain
-        # QWidget actually paint its stylesheet's background/border-radius
-        # at all, which it otherwise skips by default.
+        # Makes the window surface support real alpha at all, so the
+        # corners outside the rounded rect paintEvent() draws are truly
+        # see-through rather than an opaque black/system-colored box --
+        # still needed even though the background itself is now hand-
+        # painted rather than QSS-styled (see class docstring).
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setStyleSheet(
-            f"OverlayWindow {{"
-            f"  background-color: {OVERLAY_BACKGROUND_COLOR};"
-            f"  border: 1px solid {OVERLAY_BORDER_COLOR};"
-            f"  border-radius: 14px;"
-            f"}}"
-        )
         self.setMinimumSize(260, 140)
         self._drag_offset = None
+        # Multiplies OVERLAY_BACKGROUND_RGBA/BORDER_RGBA's own alpha in
+        # paintEvent() -- see set_opacity(). Text is deliberately NOT
+        # affected by this (see that method's docstring): an assistive
+        # overlay you're glancing at live during a call should never fade
+        # into illegibility just because the panel itself was made more
+        # see-through.
+        self._opacity = OVERLAY_OPACITY_DEFAULT_PERCENT / 100
 
         outer_layout = QVBoxLayout(self)
         outer_layout.setContentsMargins(16, 8, 16, 10)
@@ -1209,8 +1231,6 @@ class OverlayWindow(QWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(2)
 
-        self._question_label = self._add_labeled_section(content_layout, OVERLAY_QUESTION_MARKER)
-        content_layout.addSpacing(8)
         self._answer_label = self._add_labeled_section(content_layout, OVERLAY_ANSWER_MARKER)
         content_layout.addStretch()
 
@@ -1220,18 +1240,23 @@ class OverlayWindow(QWidget):
 
     def _add_labeled_section(self, layout, marker_text):
         """
-        Adds one static section marker (💬 or ⭐️, per PRD §8's Day 18
-        revision -- an icon this app draws itself, never model output)
-        plus a word-wrapped text label beneath it to `layout`.
+        Adds the static ⭐️ section marker (per PRD §8's Day 18 revision --
+        an icon this app draws itself, never model output) plus a
+        word-wrapped text label beneath it to `layout`. Only one section
+        now (Day 27 -- the "question"/transcript-excerpt section was
+        dropped), but kept as its own method rather than inlined into
+        _build_scroll_area(), since a second section is a plausible future
+        addition and the marker+label pairing is a distinct enough unit to
+        stay named.
 
         Returns:
             QLabel: the (initially empty) text label to keep updated.
         """
         caption = QLabel(marker_text)
         # Explicit color, not just relying on the emoji's own color glyph --
-        # a font/platform that only has a monochrome fallback for 💬/⭐️
-        # would otherwise inherit QLabel's default palette color instead of
-        # a guaranteed-visible one against the near-black panel. Found by
+        # a font/platform that only has a monochrome fallback for ⭐️ would
+        # otherwise inherit QLabel's default palette color instead of a
+        # guaranteed-visible one against the near-black panel. Found by
         # /code-review, Day 18.
         caption.setStyleSheet(f"color: {OVERLAY_TEXT_COLOR}; font-size: 14px;")
         layout.addWidget(caption)
@@ -1246,13 +1271,15 @@ class OverlayWindow(QWidget):
         # Day 18.
         text_label.setTextFormat(Qt.PlainText)
         text_label.setWordWrap(True)
+        # Fully opaque regardless of the overlay's own opacity slider --
+        # see set_opacity()'s docstring for why text deliberately doesn't
+        # fade.
         text_label.setStyleSheet(f"color: {OVERLAY_TEXT_COLOR}; font-size: 13px; font-weight: 700;")
         layout.addWidget(text_label)
         return text_label
 
-    def update_suggestion(self, question, answer):
-        """Updates the overlay's question and answer text to a newly received suggestion -- see _build_scroll_area() for how text longer than the window's current size stays reachable rather than getting clipped."""
-        self._question_label.setText(question)
+    def update_suggestion(self, answer):
+        """Updates the overlay's answer text to a newly received suggestion -- see _build_scroll_area() for how text longer than the window's current size stays reachable rather than getting clipped."""
         self._answer_label.setText(answer)
         # New text can make the scroll area's real vertical scrollbar
         # appear or disappear (see _build_scroll_area()'s ScrollBarAsNeeded
@@ -1265,8 +1292,45 @@ class OverlayWindow(QWidget):
         self._scroll_width_sync_timer.start()
 
     def set_opacity(self, opacity):
-        """Sets the whole overlay's opacity (0.0-1.0), including its background and text -- see create_overlay_controls()'s slider."""
-        self.setWindowOpacity(opacity)
+        """
+        Sets how see-through the overlay's black background panel is
+        (0.0-1.0, scaling OVERLAY_BACKGROUND_RGBA/BORDER_RGBA's own alpha
+        -- see create_overlay_controls()'s slider), then repaints.
+
+        Day 27: deliberately does NOT touch text opacity at all, a change
+        from the pre-Day-27 behavior (that used QWidget.setWindowOpacity(),
+        which faded the whole composited window uniformly, text included).
+        An assistive overlay you're glancing at live during a call should
+        stay fully legible no matter how transparent you've made the panel
+        behind it -- fading the text along with the background was never
+        something anyone asked for, just a side effect of how opacity used
+        to be implemented, and it's what made the underlying background
+        bug (see class docstring) easy to misread as "opacity does
+        something, just not what it's supposed to."
+        """
+        self._opacity = opacity
+        self.update()
+
+    def paintEvent(self, event):
+        """
+        Paints the rounded, translucent black panel and its border
+        directly, in place of the QSS-stylesheet approach every other
+        widget in this file uses (see class docstring for why: confirmed
+        live on the real Windows machine that the stylesheet background
+        never actually rendered, at any opacity setting). self._opacity
+        (see set_opacity()) scales OVERLAY_BACKGROUND_RGBA/BORDER_RGBA's
+        own alpha component -- text is untouched by it, painted separately
+        by the QLabels in _add_labeled_section() at full opacity always.
+        """
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        background_r, background_g, background_b, background_a = OVERLAY_BACKGROUND_RGBA
+        border_r, border_g, border_b, border_a = OVERLAY_BORDER_RGBA
+        painter.setBrush(QColor(background_r, background_g, background_b, int(background_a * self._opacity)))
+        painter.setPen(QPen(QColor(border_r, border_g, border_b, int(border_a * self._opacity)), 1))
+        # -1 on the right/bottom so the 1px border is fully inside the
+        # widget's own bounds rather than half-clipped at the edge.
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 14, 14)
 
     def set_click_through(self, enabled):
         """
@@ -1424,21 +1488,47 @@ def create_overlay_toggle(overlay_window):
     return OverlayToggle(overlay_window)
 
 
-def create_suggestions_section(layout):
+def create_suggestions_window():
     """
-    Adds a labeled, read-only pane that displays the latest suggestion from
-    wsl_app — a new one replaces whatever was shown before, rather than
-    appending to a growing list — plus a "Copy Latest Suggestion" button
-    that copies the pane's current text to the system clipboard.
+    Creates a separate, ordinary top-level window dedicated to showing the
+    latest suggestion — not part of the main window's layout at all (Day
+    27, direct user request: the main window stacks connection status,
+    both device pickers, session settings, overlay controls, and the
+    transcript pane all in one non-scrolling column above it, squeezing
+    the actual suggestion text down to a couple of visible lines). A
+    normal, independently resizable/movable window — unlike OverlayWindow,
+    nothing frameless, translucent, or click-through here — so it can be
+    made as large as needed, or moved to a second monitor, without
+    fighting the main window's layout at all. A bigger font than the main
+    window's other panes, since readability at a glance is the entire
+    point of pulling this out on its own.
+
+    Same content as the old inline section it replaces: a read-only pane
+    that shows the latest suggestion (a new one replaces whatever was
+    shown before, not appended to a growing list) plus a "Copy Latest
+    Suggestion" button.
+
+    WA_QuitOnClose is turned off, same reasoning as OverlayWindow's own
+    (see that class's docstring): without it, closing the main window
+    while this one happens to still be open would leave the app running
+    orphaned -- no main window, no session controls, nothing usable left
+    -- instead of quitting cleanly.
 
     Returns:
-        tuple[QPlainTextEdit, LatestSuggestion]: the pane to set new
+        tuple[QWidget, QPlainTextEdit, LatestSuggestion]: the window
+        itself (call .show() on it — see main()), the pane to set new
         suggestion text on, and the tracker the Copy button reads from —
-        the caller should also connect this to whatever emits new
-        suggestion text (see main()).
+        the caller should also connect this pane to whatever emits new
+        suggestion text (see create_suggestion_display()).
     """
-    layout.addWidget(QLabel("Suggestions"))
+    window = QWidget()
+    window.setWindowTitle("Adarna Suggestions")
+    window.setAttribute(Qt.WA_QuitOnClose, False)
+    window.resize(640, 520)
+    layout = QVBoxLayout(window)
+
     pane = create_readonly_text_pane(layout)
+    pane.setStyleSheet("font-size: 15px;")
 
     latest_suggestion = LatestSuggestion()
 
@@ -1451,7 +1541,7 @@ def create_suggestions_section(layout):
     copy_button.clicked.connect(copy_latest_suggestion)
     layout.addWidget(copy_button)
 
-    return pane, latest_suggestion
+    return window, pane, latest_suggestion
 
 
 def create_summary_section(layout):
@@ -1513,7 +1603,8 @@ def connect_session_recorder(wsl_connection, session_recorder):
 def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window):
     """
     Creates the SuggestionDisplay that fans out one incoming suggestion to
-    the main pane, the Copy button's tracker, and the overlay.
+    the Suggestions window's pane, the Copy button's tracker, and the
+    overlay.
 
     Returns:
         SuggestionDisplay: connect wsl_connection.suggestion_received to
@@ -2161,14 +2252,18 @@ def create_session_controls(
 
 def main():
     """
-    Entry point: creates the app, the main window, and the overlay window,
-    starts the background connection to wsl_app, wires up both audio
-    sources' capture (Day 19: WASAPI loopback for system audio, plus the
-    user's own microphone -- each with its own device picker and capture
-    status label, each its own independent AudioCaptureManager; mic
-    capture is skipped entirely, loopback-only, on a machine with no
-    usable microphone -- see get_default_mic_device()) including the live
-    Mic Enabled mute toggle (Day 24, see create_mic_toggle_checkbox), the
+    Entry point: creates the app, the main window, the overlay window, and
+    the separate Suggestions window (Day 27, see create_suggestions_window
+    -- pulled out of the main window entirely so suggestion text has real
+    room to be readable, independently resizable/movable rather than
+    squeezed into the main window's single stacked column), starts the
+    background connection to wsl_app, wires up both audio sources' capture
+    (Day 19: WASAPI loopback for system audio, plus the user's own
+    microphone -- each with its own device picker and capture status
+    label, each its own independent AudioCaptureManager; mic capture is
+    skipped entirely, loopback-only, on a machine with no usable
+    microphone -- see get_default_mic_device()) including the live Mic
+    Enabled mute toggle (Day 24, see create_mic_toggle_checkbox), the
     settings panel (including the opt-in "save transcript to a file"
     checkbox -- Day 22, see SessionRecorder), the overlay opacity/
     click-through controls, the auto-suggest toggle and manual trigger
@@ -2177,12 +2272,12 @@ def main():
     global suggestion-trigger and overlay show/hide hotkeys, and runs the
     event loop until the main window is closed.
 
-    The main window's suggestion pane stays answer-only (Day 18): the
-    overlay is the one place the question/answer excerpt pairing actually
-    matters, since it's what's glanced at live during a call, while the
-    main window is mainly used for session start/stop and settings --
-    adding the question there too didn't seem like a clear improvement,
-    just more text in a pane already working fine as-is.
+    Both the overlay and the Suggestions window are answer-only now (Day
+    27) -- the overlay used to also show the transcript excerpt that
+    prompted a suggestion (the "question"), but that was dropped per
+    direct user feedback that it read as noise once you're actually
+    glancing at this live during a call; nothing shows the question
+    anywhere any more.
     """
     app = create_app()
     window = create_window()
@@ -2201,7 +2296,7 @@ def main():
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
     transcript_display = create_transcript_display(transcript_pane)
-    suggestions_pane, latest_suggestion = create_suggestions_section(layout)
+    suggestions_window, suggestions_pane, latest_suggestion = create_suggestions_window()
     suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
     summary_pane, generate_summary_button, save_summary_button = create_summary_section(layout)
     summary_display = create_summary_display(summary_pane, generate_summary_button, save_summary_button)
@@ -2271,6 +2366,7 @@ def main():
         }
     )
 
+    suggestions_window.show()
     window.show()
     sys.exit(app.exec())
 

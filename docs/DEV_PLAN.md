@@ -1087,3 +1087,50 @@ was narrating "(silently noting the segments, no output — waiting for TRIGGER)
 notification despite already being told not to acknowledge them — the model explaining its own restraint
 instead of actually staying silent. Tightened to explicitly require zero text output, naming that exact
 line as the failure mode not to repeat.
+
+## Day 27 — Suggestions Window + Overlay Redesign
+
+User feedback after real usage, two issues: (1) the main window's cramped single-column layout
+(connection status, both device pickers, session settings, overlay controls, transcript pane all
+stacked above it) squeezed the Suggestions pane down to a couple of visible lines, cutting off real
+content; (2) the overlay's background was reported as not appearing at all — "its like it does not
+have background at all. the opacity actually just makes the text transparent" — despite the code
+already setting a black semi-transparent `rgba(0, 0, 0, 200)` CSS background.
+
+**Suggestions window**: pulled entirely out of the main window into a new, separate, ordinary
+(non-frameless, non-translucent) top-level window — `create_suggestions_window()` — independently
+resizable/movable, bigger default size (640×520), larger font. `WA_QuitOnClose` turned off, same
+reasoning as `OverlayWindow`'s own: without it, closing the main window while this one happens to
+still be open would leave the app running orphaned instead of quitting cleanly. `SuggestionDisplay`
+and everything downstream needed no changes — it was already generic over which pane it updates.
+
+**Overlay background bug, root-caused (not just patched)**: the panel relied on three separately
+interacting mechanisms — a QSS stylesheet declaring `background-color`/`border-radius`,
+`WA_StyledBackground` (needed for a plain `QWidget` to paint a stylesheet background at all), and
+`WA_TranslucentBackground` + `QWidget.setWindowOpacity()` for the translucency/opacity slider. On the
+real Windows machine, the stylesheet-declared background never actually painted at any opacity
+setting — only the text, faded uniformly by `setWindowOpacity()`, visibly responded to the slider.
+Rather than keep debugging which of the three was misbehaving without being able to see it directly
+(no way to trigger the overlay's show/hide hotkey via the established WSL→Windows UI-automation
+interop — confirmed, again, a hard limit: `pynput.keyboard.GlobalHotKeys` checks `if not injected:`
+before dispatching, so synthetic key events are silently ignored, same finding as Day 14), replaced
+all three with one directly-controlled mechanism: `OverlayWindow.paintEvent()` now paints the rounded
+black panel itself via `QPainter`, and `set_opacity()` stores the value and triggers a repaint instead
+of calling `setWindowOpacity()`.
+
+**Also changed while fixing this, both per direct request**: the opacity slider now scales only the
+*panel's* alpha, not the text's — text stays fully legible at any opacity setting, since fading actual
+suggestion text into unreadability was never something anyone asked for, just a side effect of the old
+`setWindowOpacity()` mechanism (and part of what made the background bug easy to misread as "opacity
+does *something*, just not what it's supposed to"). And the overlay dropped its "question" section
+(the 💬-marked transcript excerpt that prompted a suggestion) entirely — user feedback that it read as
+noise once actually glancing at this live during a call — leaving only the ⭐️-marked answer. The main
+window's own `SuggestionDisplay`/wire protocol still carry `question` (still used by `SessionRecorder`'s
+saved-transcript file), just no longer displayed anywhere.
+
+**Not live-verified**: this needs the real Windows machine, and the one already running at the time of
+this change was mid-session (a live-agent-listening export active), so it was deliberately left
+untouched rather than restarted to avoid interrupting it — matches this project's own standing rule
+about not taking disruptive actions against work already in progress. Needs Jon's own hands: does the
+Suggestions window actually read easier, does the overlay's background now genuinely appear, and does
+dropping the question section feel right in practice.
