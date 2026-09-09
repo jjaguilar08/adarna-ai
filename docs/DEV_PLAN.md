@@ -1134,3 +1134,51 @@ untouched rather than restarted to avoid interrupting it — matches this projec
 about not taking disruptive actions against work already in progress. Needs Jon's own hands: does the
 Suggestions window actually read easier, does the overlay's background now genuinely appear, and does
 dropping the question section feel right in practice.
+
+## Day 28 — Windows Double-Click Launcher ✅ implemented and live-verified
+
+Jon asked for a Windows executable he could directly open to start the app, instead of needing an open
+WSL terminal to run `start_app.sh`. PRD §9 originally called packaging out of scope ("runs as a dev
+tool from source ... no installer needed") — this doesn't revisit that: no PyInstaller build, no
+installer, no bundled interpreter. A real compiled `.exe` for a PySide6 + native-audio app would be a
+much bigger, riskier undertaking (a genuine Windows build/packaging pipeline, native-library bundling
+risk, antivirus false-positive risk) for a personal single-user tool where the actual complaint was
+just "I don't want to open a terminal first" — solved with far less risk by wrapping the existing,
+already-working `start_app.sh`, not replacing it.
+
+**`start_adarna.bat`** (repo root): a thin wrapper, not a reimplementation — it invokes
+`wsl.exe -d Ubuntu-22.04 bash -lc "cd /home/jon/projects/adarna-ai && ./start_app.sh"` and nothing
+else. All the real orchestration logic (starting `wsl_app`, waiting, launching `windows_app` via the
+established WSL→Windows interop, stale-port cleanup, and stopping `wsl_app` automatically when
+`windows_app` closes via `start_app.sh`'s own `trap cleanup EXIT`) stays in the one already-verified
+script, so this can never drift out of sync with how the app actually starts.
+
+**Desktop shortcut**: `C:\Users\VICGUS\OneDrive\Desktop\Adarna.lnk`, created via PowerShell's
+`WScript.Shell` COM object (`CreateShortcut`/`.Save()`) over the established WSL→Windows interop.
+Target is `cmd.exe /c "<UNC path to start_adarna.bat>"`, not the `.bat` file directly — `cmd.exe` can
+execute a script that lives on a UNC path (`\\wsl.localhost\Ubuntu-22.04\...`) as a one-off command
+target fine, but historically can't set a UNC path as its own *working directory*; routing through
+`cmd.exe /c` launched from a normal `System32` path sidesteps that distinction entirely rather than
+risking it.
+
+**Live-verified, twice, over the real interop** (no real Windows session was active at the time,
+confirmed first via `ss`/process checks — nothing was interrupted): (1) reconstructed the shortcut's
+exact target+arguments and ran them directly — `wsl_app` came up, `windows_app`'s GUI launched, both
+the main window and Day 27's new separate Suggestions window appeared correctly, screenshotted and
+visually confirmed (main window no longer has a cramped inline Suggestions section; the Suggestions
+window is large and readable, matching Day 27's intent) — then closed cleanly via a real `WM_CLOSE` to
+the main window, confirming `start_app.sh`'s trap-based `wsl_app` cleanup still fires correctly through
+this new launch path; (2) re-ran via `Start-Process` on the actual `.lnk` file itself (not a
+reconstruction — the literal thing a real double-click invokes), confirmed both windows came up the
+same way, closed the same way. Both real-machine screenshots and every started process were cleaned up
+immediately after verifying, nothing left running.
+
+**Not verified**: the overlay's own appearance from this fresh launch — still blocked by the same
+established, unfixable limit as ever (`pynput.keyboard.GlobalHotKeys` ignores synthetic key events, so
+the show/hide hotkey can't be triggered without a real physical keypress) and there was no real audio
+session run in this verification pass to actually generate a suggestion to look at anyway. Day 27's
+overlay/Suggestions-window items stay open the same way they already were.
+
+**Done when:** double-clicking `Adarna.lnk` on the Desktop starts both processes and shows the GUI with
+no terminal interaction required, and closing the main window cleanly stops `wsl_app` too — confirmed
+above, twice, over the real interop.
