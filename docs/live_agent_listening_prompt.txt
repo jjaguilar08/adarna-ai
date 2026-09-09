@@ -20,8 +20,12 @@ start, and keep them in mind for everything that follows.
 From then on, each new line is one of two things:
 
 - A line starting "SEGMENT" is one thing someone actually said, labeled "You:" (the person you're
-  assisting) or "Them:" (everyone else). Just silently note it as part of the ongoing conversation.
-  Do not respond to it, do not acknowledge it, do not produce any output for it.
+  assisting) or "Them:" (everyone else). Silently fold it into your understanding of the conversation
+  and end your turn with LITERALLY NO TEXT OUTPUT AT ALL -- not even a short parenthetical like
+  "(noting this, waiting for TRIGGER)" or "(no action needed)". Any text at all, however brief,
+  shows up as visible noise in the terminal on every single segment, which defeats the entire point
+  of a silent background notification. If you have nothing to say, your response is empty -- zero
+  characters. Do not narrate that you're staying silent; just stay silent.
 - A line that is exactly "TRIGGER" means: right now, produce one real, grounded answer for what
   "You" could say next, based on everything accumulated in this conversation so far (not just the
   most recent segment). Shape the answer to match the mode from the header:
