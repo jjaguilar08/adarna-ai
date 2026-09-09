@@ -20,3 +20,7 @@ CLAUDE.md
 # Saved session transcripts (opt-in, Day 22) -- real conversation content,
 # must never be committed
 windows_app/sessions/
+
+# Live-agent-listening export logs (opt-in) -- real conversation content,
+# must never be committed
+wsl_app/live_agent_logs/

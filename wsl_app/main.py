@@ -25,6 +25,14 @@ from streaming_transcriber import TARGET_SAMPLE_RATE, prepare_audio_for_whisper,
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 STATS_WINDOW_SECONDS = 1.0
 
+# Where opt-in live-agent-listening export logs (see LiveAgentLog) are
+# saved -- kept in wsl_app's own filesystem, not windows_app's (contrast
+# with Day 22's SessionRecorder, which is deliberately Windows-side for
+# Explorer visibility) -- the whole point of this file is to be `tail -f`'d
+# by a separate `claude` terminal session run from WSL, so keeping it in
+# WSL's filesystem avoids any cross-boundary path awkwardness for that.
+LIVE_AGENT_LOG_DIR = Path(__file__).resolve().parent / "live_agent_logs"
+
 # asyncio's StreamReader defaults to a 64KiB limit on how long one
 # newline-delimited message line can be before readline() gives up and
 # raises -- fine for the small control messages this protocol used to
@@ -689,6 +697,7 @@ def default_settings():
         "suggestion_pause_seconds": PAUSE_SECONDS_BEFORE_SUGGESTION,
         "context_notes": "",
         "auto_suggest_enabled": False,
+        "live_agent_export_enabled": False,
     }
 
 
@@ -780,6 +789,7 @@ async def handle_client(model_manager, reader, writer):
                         settings["suggestion_pause_seconds"],
                         settings["context_notes"],
                         settings["auto_suggest_enabled"],
+                        settings["live_agent_export_enabled"],
                     )
                 except Exception as error:
                     print(f"Failed to start session: {error}")
@@ -794,6 +804,8 @@ async def handle_client(model_manager, reader, writer):
                         f"Session started (mode={settings['mode']}, "
                         f"suggestion_pause={settings['suggestion_pause_seconds']}s)"
                     )
+                    if session.live_agent_log_path is not None:
+                        print(f"Live-agent-listening log: {session.live_agent_log_path}")
             elif message_type == "session_stopped":
                 if session is not None:
                     # Flushes any segment still open, on EITHER source,
@@ -1257,6 +1269,97 @@ class ClaudeCli:
         self._process.wait()
 
 
+class LiveAgentLog:
+    """
+    Writes an opt-in, plain-text, real-time-flushed log of one session's
+    transcript segments and real suggestion-trigger moments to a local file
+    under LIVE_AGENT_LOG_DIR -- the data feed for "live-agent-listening"
+    (see docs/LIVE_AGENT_LISTENING.md): a separate, manually-started
+    interactive `claude` terminal session, `tail -f`-ing this file via a
+    background Bash task and Monitor (the same mechanism proven in
+    docs/DEV_PLAN.md's Day 18.8-18.10), can react to SEGMENT lines as cheap
+    background notifications and produce one real, grounded answer whenever
+    a TRIGGER line arrives -- with near-zero latency at that point, since
+    the conversation is already live in that agent's own context rather
+    than reconstructed per call the way ClaudeCli's one-shot suggestions
+    are. Off by default and no behavior change at all unless the user opts
+    in -- same consent stance as SessionRecorder (windows_app/main.py, Day
+    22): this also continuously writes real conversation content to disk.
+
+    Deliberately NOT the same file as SessionRecorder's session recording:
+    that file has no "decide now" signal in it (a TRIGGER moment there is
+    indistinguishable from an already-generated suggestion line) and its
+    privacy checkbox means something different to the user than opting
+    into this. record_segment()/record_trigger() are safe no-ops while no
+    file is open, matching SessionRecorder's own idiom, and each line is
+    flushed immediately so a crash mid-session doesn't lose an otherwise-
+    complete log.
+    """
+
+    def __init__(self):
+        """Starts with no file open -- start() opens one when an exporting session begins."""
+        self._file = None
+
+    def start(self, mode, context_notes, auto_suggest_enabled, pause_seconds):
+        """
+        Opens a new timestamped file under LIVE_AGENT_LOG_DIR and writes its
+        header: start time, mode, and the auto_suggest/pause_seconds
+        settings that govern whether and how often TRIGGER lines can
+        actually appear (see class docstring -- TRIGGER lines are entirely
+        piggybacked on the existing SuggestionTrigger, there's no
+        independent cadence for this feature), plus context_notes verbatim
+        if any were given, since a tailing agent's own operating
+        instructions should match the same mode/context framing
+        MEETING_SYSTEM_PROMPT/INTERVIEW_SYSTEM_PROMPT already use.
+
+        Returns:
+            Path: the opened file's path, so the caller (handle_client) can
+            print it for the user to point their separate terminal at.
+        """
+        LIVE_AGENT_LOG_DIR.mkdir(exist_ok=True)
+        started_at = time.localtime()
+        filename = f"live_agent_{time.strftime('%Y-%m-%d_%H%M%S', started_at)}.log"
+        path = LIVE_AGENT_LOG_DIR / filename
+        self._file = open(path, "w", encoding="utf-8")
+        self._write(
+            f"=== live-agent-listening session started {time.strftime('%Y-%m-%d %H:%M:%S', started_at)} "
+            f"(mode: {mode}, auto_suggest: {'on' if auto_suggest_enabled else 'off'}, "
+            f"suggestion_pause: {pause_seconds}s) ==="
+        )
+        if context_notes:
+            self._write("--- context notes begin ---")
+            self._write(context_notes)
+            self._write("--- context notes end ---")
+        return path
+
+    def stop(self):
+        """Writes a footer line and closes the file, if one is open. A safe no-op otherwise."""
+        if self._file is None:
+            return
+        self._write(f"=== live-agent-listening session ended {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
+        self._file.close()
+        self._file = None
+
+    def record_segment(self, source, text):
+        """Appends one timestamped, source-labeled transcript segment ("You:"/"Them:", matching _format_context()'s own shape), if a session is currently exporting."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self._write(f"{timestamp} SEGMENT {SOURCE_LABELS[source]}: {text}")
+
+    def record_trigger(self):
+        """Appends one timestamped TRIGGER line -- the cue for a tailing agent to produce one real answer -- if a session is currently exporting."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self._write(f"{timestamp} TRIGGER")
+
+    def _write(self, line):
+        """Writes one line to the open file and flushes immediately, so partial content already on disk survives a crash."""
+        self._file.write(line + "\n")
+        self._file.flush()
+
+
 class SuggestionTrigger:
     """
     Decides when to ask claude for a new suggestion. Built on top of the
@@ -1377,15 +1480,19 @@ class MeetingSession:
     each time and cleanly torn down together: speech segmentation (one
     independent VoiceSegmenter per audio source -- see self.segmenters),
     the running claude CLI process behind it, the pause/hotkey suggestion
-    trigger, and a short rolling history of recent transcript segments (from
+    trigger, a short rolling history of recent transcript segments (from
     both sources, chronologically ordered -- see add_transcript_segment) to
-    give suggestions context. If the claude CLI process crashes mid-session,
+    give suggestions context, and the opt-in live-agent-listening export
+    log (see LiveAgentLog). If the claude CLI process crashes mid-session,
     one restart is attempted automatically (see _ask_with_restart_on_crash)
     — recent_transcript_segments lives here, not in ClaudeCli, so a restart
     doesn't lose the transcript context built up so far.
     """
 
-    def __init__(self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=False):
+    def __init__(
+        self, writer, model, mode, pause_seconds, context_notes="", auto_suggest_enabled=False,
+        live_agent_export_enabled=False,
+    ):
         """
         Starts a fresh session using the settings captured for it at
         session_started (see handle_client): a fresh VoiceSegmenter per
@@ -1395,9 +1502,19 @@ class MeetingSession:
         never affect the other's segment boundaries), `model` as the
         Whisper model this session transcribes
         with for its entire lifetime, a new claude CLI process framed for
-        `mode` and `context_notes`, empty transcript history, and a
+        `mode` and `context_notes`, empty transcript history, a
         suggestion trigger using `pause_seconds` and starting with
-        auto-suggest set to `auto_suggest_enabled`.
+        auto-suggest set to `auto_suggest_enabled`, and -- if
+        `live_agent_export_enabled` -- a started LiveAgentLog (self.
+        live_agent_log_path is None otherwise, for handle_client to check).
+
+        self.live_agent_log is started as the LAST statement here,
+        deliberately after self.trigger -- ClaudeCli(...) above is the one
+        call in this constructor that can raise (a subprocess start
+        failure; handle_client's existing try/except around this whole
+        constructor already turns that into a session_start_failed message
+        to windows_app), and starting the log first would leave an opened-
+        but-never-stop()'d file behind if that raised.
         """
         self.writer = writer
         self.model = model
@@ -1418,6 +1535,11 @@ class MeetingSession:
         # the pause timer or the hotkey is still using it.
         self._claude_cli_lock = asyncio.Lock()
         self.trigger = SuggestionTrigger(self._generate_and_send_suggestion, pause_seconds, auto_suggest_enabled)
+        self.live_agent_log = LiveAgentLog()
+        self.live_agent_log_path = (
+            self.live_agent_log.start(mode, context_notes, auto_suggest_enabled, pause_seconds)
+            if live_agent_export_enabled else None
+        )
 
     def set_auto_suggest_enabled(self, enabled):
         """Turns this session's pause-triggered suggestions on or off, live. See SuggestionTrigger.set_auto_suggest_enabled."""
@@ -1436,11 +1558,14 @@ class MeetingSession:
         other) -- this keeps the context Claude sees in the same
         chronological order the conversation actually happened in, not
         transcription-completion order. See _trim_context_to_budget() for
-        how the window is kept bounded.
+        how the window is kept bounded. Also records this segment to the
+        live-agent-listening export log, if one is open -- a safe no-op
+        otherwise.
         """
         bisect.insort(self.recent_transcript_segments, (started_at, source, text))
         self._trim_context_to_budget()
         self.trigger.notify_new_segment()
+        self.live_agent_log.record_segment(source, text)
 
     def _trim_context_to_budget(self):
         """
@@ -1500,6 +1625,14 @@ class MeetingSession:
         particular suggestion — the transcript context this session has
         built up lives in recent_transcript_segments, not in ClaudeCli, so
         a restart doesn't lose anything and the next trigger can try again.
+
+        Also records a TRIGGER line to the live-agent-listening export log
+        (if one is open) right here, once there's real context to answer
+        from -- not any earlier (e.g. past the lock-check above) -- so a
+        hotkey press before any segment has ever arrived, which this method
+        already silently no-ops on via the prompt_text check below, doesn't
+        also tell a tailing agent "answer now" with nothing yet in the log
+        to answer from.
         """
         if self._claude_cli_lock.locked():
             return
@@ -1507,6 +1640,7 @@ class MeetingSession:
             prompt_text = self._format_context()
             if not prompt_text:
                 return
+            self.live_agent_log.record_trigger()
             loop = asyncio.get_running_loop()
 
             def send_partial_suggestion(partial_text):
@@ -1604,8 +1738,14 @@ class MeetingSession:
         caller (see handle_client's session_stopped branch) before this is
         called, not here -- flushing kicks off its own background
         transcribe-and-report task, which doesn't need to (and shouldn't)
-        block session teardown.
+        block session teardown; that trailing segment will not reach the
+        live-agent-listening export log below either, for the same reason
+        it doesn't reach the suggestion trigger (see that branch's own
+        docstring) -- there's no live session left to record it into by the
+        time it finishes transcribing, and closing the log's file here
+        first means it's very likely already closed by then regardless.
         """
+        self.live_agent_log.stop()
         self.trigger.stop()
         async with self._claude_cli_lock:
             await asyncio.to_thread(self._claude_cli.stop)

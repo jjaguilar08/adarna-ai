@@ -942,3 +942,75 @@ note at the top of this Day 23 section. Jon ran a real transcript through Genera
 Summary in the actual GUI and confirmed the saved file was good.
 
 </details>
+
+## Day 24 — Live Mic Mute Toggle ✅ implemented and live-verified
+
+Added 2026-09-09, Jon's request: real background noise (someone else's TV/conversation in the room)
+sometimes bleeds into a real mic's noise floor mid-session, and stopping the whole session just to
+avoid transcribing it was the only option. `windows_app` gained a "Mic enabled" checkbox (checked by
+default), live-toggleable at any point during a running session — unchecking it immediately mutes mic
+capture (`AudioCaptureManager.stop_capture()`) without touching loopback or ending the session;
+re-checking it resumes capture. Also read once at Start Session, so a session can begin with the mic
+already muted. Purely local to `windows_app` — no wire-protocol change, since muting just means
+wsl_app stops receiving `audio_chunk` messages for that source; its `VoiceSegmenter` for mic simply
+sees nothing in the meantime.
+
+**Live-verified by Jon in the real app:** confirmed working — mid-session mute/unmute and starting a
+session already muted both behaved as expected.
+
+## Day 25 — Live-Agent-Listening Export (real, shippable second suggestion mode)
+
+Turns the Day 18.8-18.10 research finding into an actual capability, per Jon's request after asking
+what was next once Phase 3 (the last committed PRD phase) finished with Day 23. Days 18.8-18.10 proved
+an interactive `claude` terminal session — watching a background task's stdout via the Monitor tool —
+can react to transcript segments as cheap notifications and produce a real, grounded answer only when
+triggered, with near-zero added latency at that point since the conversation is already live in the
+agent's own context. That was only ever proven against synthetic WAV playback harnesses
+(`wsl_app/research/day18_8/`, `day18_10/`), bypassing the real production pipeline entirely.
+
+**Two design calls confirmed with Jon before building:**
+1. **Data feed**: a new, dedicated live-export log purpose-built for this mode, not a reuse of Day
+   22's opt-in session-recording feature — that file has no clean "decide now" signal, and conflates
+   two conceptually different opt-in checkboxes.
+2. **Answer surface**: the live agent's real answers stay in its own separate terminal only — no
+   attempt to route them back into `windows_app`'s GUI/overlay, which would add a new hop and work
+   against the mechanism's whole appeal.
+
+**Implemented:**
+- `wsl_app/main.py`: new `LiveAgentLog` class (mirrors `SessionRecorder`'s safe-no-op/flush-per-write
+  idiom), writing a header (mode, auto_suggest state, suggestion_pause, context notes), one `SEGMENT`
+  line per transcribed segment (`SOURCE_LABELS`-labeled, matching `_format_context()`'s own "You:"/
+  "Them:" shape), one `TRIGGER` line every time the *existing* `SuggestionTrigger` mechanism actually
+  fires (piggybacked on the shipped trigger, not a new independent cadence), and a footer on close.
+  Wired into `MeetingSession` as the last constructor statement (after `ClaudeCli`, the one call there
+  that can raise — avoids leaking an opened file if construction fails partway through) and a new
+  `live_agent_export_enabled` settings field. Console prints the log's path when a session starts with
+  it enabled.
+- `windows_app/main.py`: new "Enable live-agent-listening export" checkbox (Session Settings, unchecked
+  by default, read once at Start Session, crosses the wire via `settings_changed` — unlike Day 22's
+  transcript checkbox, this feature lives on the wsl_app side). Window-title indicator generalized from
+  a single `RECORDING_WINDOW_TITLE` constant to `session_recording_window_title()`, composing the title
+  from whichever disk-writing opt-ins (this one, Day 22's) are actually active.
+- New permanent runbook: `docs/LIVE_AGENT_LISTENING.md` — exactly how to point a second, manually-
+  started interactive `claude` session at the real log for a real meeting, using the same Bash-
+  background-task + Monitor pattern already proven, including the operating-instructions text to give
+  that session (there's no `--system-prompt` flag for an interactive session).
+- `wsl_app/live_agent_logs/` gitignored (real conversation content).
+
+**Live-verified (wsl_app-side plumbing only)**: a real wire-protocol test (isolated port, not the
+shared one) — checkbox off produced zero file/directory activity; checkbox on, with real WAV audio
+streamed through the actual production pipeline (segmentation → transcription → the real
+`SuggestionTrigger`), produced a correctly-formed header + context notes, `SEGMENT` lines with accurate
+transcribed text and correct `You:`/`Them:` labels, `TRIGGER` lines at genuine suggestion-fire moments,
+and a clean footer on `session_stopped`.
+
+**Not yet live-verified — needs Jon's own hands, per this project's established "Jon runs this
+directly" pattern (Day 18.9):** the actual `windows_app` checkbox/title behavior on real Windows, and
+— the real point of this whole feature — a second, separate interactive `claude` session genuinely
+tailing the real log during a real (or real-mic) meeting and producing useful answers, hands-off, the
+way Day 18.8-18.10 proved for synthetic audio.
+
+**Done when:** a real meeting, run with the export checkbox on, produces a correctly-formed live log;
+a separately-started interactive `claude` session, following docs/LIVE_AGENT_LISTENING.md, tails it and
+reacts to real `SEGMENT`/`TRIGGER` lines with no manual intervention during the meeting; and its
+answers are genuinely useful, not just mechanically present.

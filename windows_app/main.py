@@ -44,11 +44,13 @@ CHUNK_SECONDS = 0.1
 # user would actually look for it (Windows Explorer), not the WSL filesystem.
 SESSIONS_DIR = Path(__file__).resolve().parent / "sessions"
 
-# Window title shown while a session is being saved to disk (see
-# SessionRecorder) -- the feature exists for a consent/privacy reason (PRD
-# §5/§9, RA 4200), so it shouldn't be silently invisible once turned on.
+# Default window title, and the title shown for as long as any opt-in
+# disk-writing feature is active for the current session (see
+# SessionRecorder, LiveAgentLog on the wsl_app side, and
+# session_recording_window_title() below) -- each such feature exists for
+# a consent/privacy reason (PRD §5/§9, RA 4200), so none of them should be
+# silently invisible once turned on.
 DEFAULT_WINDOW_TITLE = "Adarna"
-RECORDING_WINDOW_TITLE = "Adarna (saving session to disk)"
 
 # How long the capture loop waits for the next audio block before checking
 # whether it's been told to stop. Keeps Stop Session/a device switch
@@ -1629,14 +1631,21 @@ def create_settings_panel(layout):
 
     Also includes the "Save this session's transcript to a file" checkbox
     (Day 22, unchecked by default) that opts a session into local, on-disk
-    recording via SessionRecorder -- lives here, not its own group, since it
-    shares this panel's rule of being read once at Start Session rather than
+    recording via SessionRecorder, and the "Enable live-agent-listening
+    export" checkbox (unchecked by default) that opts a session into
+    wsl_app writing its own separate, tailable log for a manually-started
+    live-agent-listening session (see docs/LIVE_AGENT_LISTENING.md) --
+    unlike the transcript checkbox, this one crosses the wire (see
+    current_settings_message()), since the file it controls lives on the
+    wsl_app side, not here. Both live here, not their own group, since they
+    share this panel's rule of being read once at Start Session rather than
     live-toggleable mid-session, same as mode/pause/context notes.
 
     Returns:
-        tuple[QComboBox, QComboBox, QPlainTextEdit, QCheckBox]: the mode
-        and suggestion pause dropdowns, the context notes text box, and the
-        save-transcript checkbox, in that order.
+        tuple[QComboBox, QComboBox, QPlainTextEdit, QCheckBox, QCheckBox]:
+        the mode and suggestion pause dropdowns, the context notes text
+        box, the save-transcript checkbox, and the live-agent-listening
+        export checkbox, in that order.
     """
     group = QGroupBox("Session Settings")
     form = QFormLayout(group)
@@ -1665,11 +1674,19 @@ def create_settings_panel(layout):
     save_transcript_checkbox.setChecked(False)
     form.addRow(save_transcript_checkbox)
 
+    live_agent_export_checkbox = QCheckBox(
+        "Enable live-agent-listening export (writes a tailable log for a separate claude session)"
+    )
+    live_agent_export_checkbox.setChecked(False)
+    form.addRow(live_agent_export_checkbox)
+
     layout.addWidget(group)
-    return mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox
+    return mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox, live_agent_export_checkbox
 
 
-def current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox):
+def current_settings_message(
+    mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox, live_agent_export_checkbox
+):
     """
     Reads the settings panel's current values and packages them into the
     settings_changed message to send wsl_app.
@@ -1682,6 +1699,7 @@ def current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, 
         "mode": MODE_LABELS_TO_VALUES[mode_dropdown.currentText()],
         "suggestion_pause_seconds": pause_dropdown.currentData(),
         "context_notes": context_notes_edit.toPlainText().strip(),
+        "live_agent_export_enabled": live_agent_export_checkbox.isChecked(),
         "auto_suggest_enabled": auto_suggest_checkbox.isChecked(),
     }
 
@@ -1909,6 +1927,30 @@ def create_audio_capture_manager(audio, wsl_connection, source, device_dropdown,
     return capture_manager
 
 
+def session_recording_window_title(save_transcript_active, live_agent_export_active):
+    """
+    Builds the window title from whichever opt-in disk-writing features are
+    active for the current session -- DEFAULT_WINDOW_TITLE if neither is,
+    otherwise DEFAULT_WINDOW_TITLE with each active feature named, so it's
+    never silently invisible that something is being written to disk (see
+    DEFAULT_WINDOW_TITLE's own comment). Composed from a list rather than a
+    fixed set of title constants (the old RECORDING_WINDOW_TITLE) so a
+    future third disk-writing opt-in doesn't need its own combinatorial set
+    of title strings.
+
+    Returns:
+        str: the window title to set.
+    """
+    reasons = []
+    if save_transcript_active:
+        reasons.append("saving session to disk")
+    if live_agent_export_active:
+        reasons.append("live-agent export active")
+    if not reasons:
+        return DEFAULT_WINDOW_TITLE
+    return f"Adarna ({', '.join(reasons)})"
+
+
 def create_session_controls(
     wsl_connection,
     capture_managers,
@@ -1919,6 +1961,7 @@ def create_session_controls(
     context_notes_edit,
     auto_suggest_checkbox,
     save_transcript_checkbox,
+    live_agent_export_checkbox,
     session_recorder,
     transcript_display,
     summary_display,
@@ -1931,16 +1974,20 @@ def create_session_controls(
     starting clears the transcript pane (see TranscriptDisplay.reset —
     Day 17: otherwise a new session's transcript would appear appended
     right after whatever the previous one left on screen), sends the
-    settings panel's current values (including the context notes and the
-    auto-suggest checkbox's starting state) as settings_changed, then
+    settings panel's current values (including the context notes, the
+    auto-suggest checkbox's starting state, and the live-agent-listening
+    export checkbox's starting state) as settings_changed, then
     session_started (tagged with a fresh attempt_id — see
     handle_session_start_failed), starts capture on every manager in
     `capture_managers` (Day 19: one for mic, one for loopback — each is
     already its own independent capture thread, so starting/stopping both
-    here just means neither has to wait on the other), and -- if
-    save_transcript_checkbox is checked -- starts session_recorder saving
-    this session to disk (Day 22) and shows RECORDING_WINDOW_TITLE so
-    that's visible for as long as it's on; stopping sends session_stopped,
+    here just means neither has to wait on the other), starts
+    session_recorder if save_transcript_checkbox is checked (Day 22), and
+    sets the window title via session_recording_window_title() to reflect
+    whichever of that and live_agent_export_checkbox are on -- wsl_app
+    owns the live-agent-listening log itself (see docs/LIVE_AGENT_LISTENING.md),
+    this side just sends the flag and shows the same kind of visible
+    indicator Day 22 already established; stopping sends session_stopped,
     stops every manager, stops session_recorder (a safe no-op if it was
     never started), and restores the window title. Button enabled-state
     tracks which action is currently valid.
@@ -2010,14 +2057,16 @@ def create_session_controls(
         generate_summary_button.setEnabled(bool(transcript_display.full_text()))
 
     def start_session():
-        """Begins a session: clears the transcript pane and any previous summary, sends the current settings, notifies wsl_app, starts capture on every source (skipping the mic if Mic Enabled is already unchecked), starts session_recorder if the user opted in, and flips button state."""
+        """Begins a session: clears the transcript pane and any previous summary, sends the current settings, notifies wsl_app, starts capture on every source (skipping the mic if Mic Enabled is already unchecked), starts session_recorder if the user opted in, sets the window title to reflect whichever disk-writing opt-ins are active, and flips button state."""
         nonlocal current_attempt_id
         current_attempt_id += 1
         transcript_display.reset()
         summary_display.reset()
         generate_summary_button.setEnabled(False)
         wsl_connection.send_message(
-            current_settings_message(mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox)
+            current_settings_message(
+                mode_dropdown, pause_dropdown, context_notes_edit, auto_suggest_checkbox, live_agent_export_checkbox
+            )
         )
         wsl_connection.send_message({"type": "session_started", "attempt_id": current_attempt_id})
         mic_starts_muted = (
@@ -2031,7 +2080,9 @@ def create_session_controls(
             capture_manager.start_capture()
         if save_transcript_checkbox.isChecked():
             session_recorder.start(mode_dropdown.currentText())
-            window.setWindowTitle(RECORDING_WINDOW_TITLE)
+        window.setWindowTitle(
+            session_recording_window_title(save_transcript_checkbox.isChecked(), live_agent_export_checkbox.isChecked())
+        )
         start_button.setEnabled(False)
         stop_button.setEnabled(True)
 
@@ -2142,7 +2193,9 @@ def main():
     mic_device_dropdown = create_device_dropdown(layout, "Microphone device (your own voice, i.e. \"You\"):")
     mic_capture_status_label = create_capture_status_label(layout)
     mic_enabled_checkbox = create_mic_toggle_checkbox(layout)
-    mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox = create_settings_panel(layout)
+    mode_dropdown, pause_dropdown, context_notes_edit, save_transcript_checkbox, live_agent_export_checkbox = (
+        create_settings_panel(layout)
+    )
     overlay_window = create_overlay_window()
     create_overlay_controls(layout, overlay_window)
     auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
@@ -2196,6 +2249,7 @@ def main():
         context_notes_edit,
         auto_suggest_checkbox,
         save_transcript_checkbox,
+        live_agent_export_checkbox,
         session_recorder,
         transcript_display,
         summary_display,
