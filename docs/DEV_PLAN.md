@@ -1182,3 +1182,28 @@ overlay/Suggestions-window items stay open the same way they already were.
 **Done when:** double-clicking `Adarna.lnk` on the Desktop starts both processes and shows the GUI with
 no terminal interaction required, and closing the main window cleanly stops `wsl_app` too — confirmed
 above, twice, over the real interop.
+
+## Day 29 — App Icon
+
+Jon shared the Adarna bird logo (a blue circular badge with a white/blue bird in flight) and asked for
+it as the app's icon. Source image (`windows_app/icon.png`, 312×301 — padded to a true 312×312 square
+before generating icon frames, since the slight off-square source otherwise produced a visibly
+non-square 32×31 frame in the first pass) converted to a proper multi-resolution `windows_app/icon.ico`
+(16/24/32/48/64/128/256px, via a throwaway Pillow install — not a new project dependency, discarded
+after use) — `.ico` specifically for the app itself, not the plain PNG, since it's the one format that
+bundles every size Windows actually needs (title bar, taskbar, Alt+Tab) rather than blurrily rescaling
+one size for all of them.
+
+Set application-wide via `QApplication.setWindowIcon()` in `create_app()` — covers the main window, the
+Suggestions window, and the overlay all from one call, rather than repeating it per window. Also set as
+the Day 28 Desktop shortcut's `IconLocation` (previously just the generic `cmd.exe` icon, since its
+target is `cmd.exe`).
+
+**Live-verified over the real interop**: launched via the real `Adarna.lnk` (same as Day 28's
+verification), screenshotted and confirmed the bird renders correctly in both the title bar and the
+Windows taskbar. One real hiccup caught and fixed along the way: re-saving the shortcut through
+`WScript.Shell` to add just `IconLocation` silently blanked `TargetPath`/`Arguments`/`WorkingDirectory`
+on this machine (OneDrive-synced Desktop, possibly a sync-timing factor) — caught immediately by
+re-reading the shortcut's properties back after saving, rather than assuming the save worked; fixed by
+recreating the shortcut with every property set together in one pass instead of a separate load-modify
+step. Cleaned up (closed the test session, removed temp screenshots) immediately after verifying.

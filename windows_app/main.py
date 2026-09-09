@@ -11,7 +11,7 @@ from pathlib import Path
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QTextBlockFormat
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextBlockFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,6 +38,15 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "ipc_config.json"
 PING_INTERVAL_SECONDS = 2
 RECONNECT_DELAY_SECONDS = 2
 CHUNK_SECONDS = 0.1
+
+# App icon (Day 29, the Adarna bird logo) -- .ico specifically, not the
+# .png sitting alongside it, since .ico natively bundles multiple
+# resolutions (16/24/32/48/64/128/256px) for crisp rendering at every size
+# Windows actually uses one (title bar, taskbar, Alt+Tab); a single PNG
+# would just get blurrily rescaled at the sizes that aren't its native
+# one. icon.png is kept alongside as the plain source image, in case it's
+# ever needed for something that isn't a Windows icon.
+ICON_PATH = Path(__file__).resolve().parent / "icon.ico"
 
 # Where opt-in session transcripts (Day 22, see SessionRecorder) are saved --
 # under windows_app/ itself, not wsl_app, so the file lands somewhere the
@@ -554,12 +563,20 @@ class AudioCaptureManager(QObject):
 
 def create_app():
     """
-    Creates the Qt application instance that owns the event loop.
+    Creates the Qt application instance that owns the event loop, with the
+    Adarna icon (see ICON_PATH) set application-wide -- every window this
+    process creates (main window, the Suggestions window, the overlay)
+    inherits it as their own icon unless they set one of their own, so this
+    one call covers all of them rather than needing setWindowIcon() on
+    each window individually. Covers the title bar, taskbar, and Alt+Tab
+    icon on Windows.
 
     Returns:
         QApplication: the single application instance for this process.
     """
-    return QApplication(sys.argv)
+    app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon(str(ICON_PATH)))
+    return app
 
 
 def create_window():
