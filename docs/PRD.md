@@ -8,7 +8,7 @@
 
 ## 1. Overview
 
-A Windows desktop tool that listens to system audio during a live call (work meeting, mock interview, or real interview), transcribes it locally in real time, and — on a trigger — asks a locally-invoked Claude (via the Claude Code CLI, using Jon's existing Claude.ai subscription, not a paid API key) to generate a suggested response. The suggestion appears in an app window Jon can glance at during the call.
+A Windows desktop tool that listens to system audio during a live call (work meeting or interview practice), transcribes it locally in real time, and — on a trigger — asks a locally-invoked Claude (via the Claude Code CLI, using Jon's existing Claude.ai subscription, not a paid API key) to generate a suggested response. The suggestion appears in an app window Jon can glance at during the call.
 
 A post-call summary feature is explicitly a later phase, not part of the MVP.
 
@@ -29,11 +29,10 @@ A post-call summary feature is explicitly a later phase, not part of the MVP.
 
 ## 4. Users & Use Cases
 
-Single user (Jon). Three use modes, same underlying pipeline:
+Single user (Jon). Two use modes, same underlying pipeline:
 
 1. **Work meetings** (primary) — live assist during calls, eventually with a post-meeting summary of what was discussed.
-2. **Mock interviews** — practice runs, live or reviewed after.
-3. **Real job interviews** — used live, as interview practice.
+2. **Interview practice** — mock interviews, live or reviewed after.
 
 The suggestion prompt should differ by mode (a work-meeting suggestion looks different from an interview-answer suggestion), so "mode" is a first-class setting, not an afterthought.
 
@@ -41,8 +40,7 @@ The suggestion prompt should differ by mode (a work-meeting suggestion looks dif
 
 Flagged once during planning, carried into the design rather than ignored:
 
-
-- The Philippines' Anti-Wiretapping Act (RA 4200) generally requires consent to record private communications. This shapes one concrete design default: **the MVP does not persist raw audio or transcripts to disk.** Everything lives in memory for the duration of a session and is discarded on close unless a later phase adds an explicit, opt-in "save this session" action.
+- Recording or transcribing another person's speech without their knowledge can implicate consent/wiretapping laws depending on jurisdiction — e.g. the Philippines' Anti-Wiretapping Act (RA 4200) generally requires consent to record private communications. This shapes one concrete design default: **the MVP does not persist raw audio or transcripts to disk.** Everything lives in memory for the duration of a session and is discarded on close unless a later phase adds an explicit, opt-in "save this session" action.
 
 This isn't legal advice, just a design constraint carried from the earlier discussion.
 
