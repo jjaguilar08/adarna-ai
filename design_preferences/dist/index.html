@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Adarna — a real-time copilot for live conversations</title>
+<meta name="description" content="Adarna listens to a meeting as it happens, transcribes it locally, and drafts the next thing you could say — a solo-built, cross-OS real-time engineering project.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Condensed:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<nav class="nav">
+  <span class="nav-brand">
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color: var(--color-accent-700)"><path d="M16 7h.01"></path><path d="M3.4 18H12a8 8 0 0 0 8-8V7a4 4 0 0 0-7.28-2.3L2 20"></path><path d="m20 7 2 .5-2 .5"></path><path d="M10 18v3"></path><path d="M14 17.75V21"></path><path d="M7 18a6 6 0 0 0 3.84-10.61"></path></svg>
+    Adarna
+  </span>
+  <a href="#app">In the app</a>
+  <a href="#how">How it works</a>
+  <a href="#features">Highlights</a>
+  <a href="#hood">Under the hood</a>
+  <a class="btn btn-primary" href="https://github.com/jjaguilar08/adarna-ai" target="_blank" rel="noopener">View source</a>
+</nav>
+
+<div class="wrap">
+
+  <section class="hero">
+    <div>
+      <span class="eyebrow">Personal project · 2026</span>
+      <hr class="hr" style="margin-bottom: 24px;">
+      <h1>A real-time copilot for live conversations</h1>
+      <p class="lede">Adarna listens to a meeting as it happens, transcribes it on your own machine, and — on a pause or a hotkey — drafts the next thing you could say. It arrives in an always-on-top overlay you can glance at without leaving the call.</p>
+      <p class="sub">Built solo, end to end: Windows audio capture, local speech-to-text, a two-process cross-OS architecture, and a Claude session that never leaves the machine unless it has to.</p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="#hood">Read the architecture</a>
+        <a class="btn btn-ghost" href="https://github.com/jjaguilar08/adarna-ai" target="_blank" rel="noopener">GitHub</a>
+      </div>
+    </div>
+
+    <figure class="blueprint overlay-frame">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <header>
+        <span><span class="dot"></span>Listening</span>
+        <span>Overlay · opacity 90%</span>
+      </header>
+      <img src="screenshots/overlay.png" alt="Adarna's always-on-top overlay showing a real streamed suggestion during a mock interview exchange" width="440" height="163">
+    </figure>
+  </section>
+
+  <section class="tight" aria-label="System characteristics">
+    <div class="blueprint stats">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <div class="stats-header">
+        <span>Adarna — system characteristics</span>
+        <span>Solo build</span>
+        <span>Sheet 01 of 03</span>
+      </div>
+      <div class="stats-grid">
+        <div>
+          <span class="stat-label">01 · Pause to suggestion</span>
+          <span class="stat-value">5–8 s</span>
+          <span class="stat-caption">End of speech to first streamed token</span>
+        </div>
+        <div>
+          <span class="stat-label">02 · Speech-to-text</span>
+          <span class="stat-value">100% local</span>
+          <span class="stat-caption">faster-whisper on device, no cloud STT</span>
+        </div>
+        <div>
+          <span class="stat-label">03 · Audio sources</span>
+          <span class="stat-value">2 streams</span>
+          <span class="stat-caption">Mic + WASAPI loopback, merged and labeled</span>
+        </div>
+        <div>
+          <span class="stat-label">04 · Written to disk</span>
+          <span class="stat-value">Nothing</span>
+          <span class="stat-caption">Unless session recording is opted into</span>
+        </div>
+      </div>
+      <p class="stats-footnote">Measured on the developer's own hardware across repeated live-call testing, not in a benchmark harness.</p>
+    </div>
+  </section>
+
+  <section id="app">
+    <span class="kicker">02 · The app itself</span>
+    <hr class="hr section-head">
+    <div class="shots-grid">
+      <figure>
+        <img src="screenshots/main_window.png" alt="Adarna's main window: connection status, audio device pickers, session settings, overlay controls, and the merged, labeled live transcript">
+        <figcaption>Main window — device setup, session settings, and the merged "You" / "Them" transcript, live.</figcaption>
+      </figure>
+      <figure>
+        <img src="screenshots/suggestions_window.png" alt="Adarna's dedicated Suggestions window showing a full-length suggested response, with a Copy Latest Suggestion button">
+        <figcaption>Suggestions window — pulled out on its own (Day 27) so a full answer has real room to read.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <section id="how">
+    <span class="kicker">03 · How it works</span>
+    <hr class="hr section-head">
+    <div class="steps-grid">
+      <div class="blueprint step">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <span class="step-index">Step 01</span>
+        <h3>Listen</h3>
+        <p>It hears both sides of the call — your voice and theirs — the moment the call starts.</p>
+        <p class="tech-note">WASAPI loopback for system audio, a parallel microphone stream, WebRTC VAD segmenting speech from silence.</p>
+      </div>
+      <div class="blueprint step">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <span class="step-index">Step 02</span>
+        <h3>Transcribe</h3>
+        <p>Speech becomes text on your own machine, tagged with who said it.</p>
+        <p class="tech-note">faster-whisper in a WSL worker; the two source streams are ordered independently, then merged in true spoken order.</p>
+      </div>
+      <div class="blueprint step">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <span class="step-index">Step 03</span>
+        <h3>Suggest</h3>
+        <p>On a natural pause — or when you press the hotkey — Claude drafts what you could say next.</p>
+        <p class="tech-note">A long-lived Claude CLI session holds the conversation; mode-aware prompting shapes the answer.</p>
+      </div>
+      <div class="blueprint step">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <span class="step-index">Step 04</span>
+        <h3>Glance</h3>
+        <p>The suggestion streams into a small overlay above the call. You read it and keep talking.</p>
+        <p class="tech-note">Always-on-top PySide6 window: draggable, resizable, adjustable opacity, optional click-through.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="features">
+    <span class="kicker">04 · Highlights</span>
+    <hr class="hr section-head">
+    <div class="features-grid">
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>Nothing leaves the machine unnecessarily</h3>
+        <p>Transcription runs locally and nothing is written to disk unless you explicitly turn on session recording — the default is a system that forgets.</p>
+      </div>
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>It knows who said what</h3>
+        <p>Microphone and system audio are transcribed separately, then merged in spoken order and labeled "You" and "Them", so suggestions answer the right person.</p>
+      </div>
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>Two modes, two shapes of answer</h3>
+        <p>Work Meeting mode replies in a sentence or two. Interview mode returns a short narrative plus bullets, branching again by the kind of question asked.</p>
+      </div>
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>An overlay that stays out of the way</h3>
+        <p>Always-on-top, draggable, resizable, opacity-adjustable, optionally click-through. Suggestions stream token by token so you can start reading immediately.</p>
+      </div>
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>Defended against hallucinated speech</h3>
+        <p>Filtering on the speech-to-text output catches both failure modes: confident silence transcribed as words, and thin signal that sends the model free-associating.</p>
+      </div>
+      <div class="blueprint feature-card">
+        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <h3>Proven on real hardware, not just in review</h3>
+        <p>Several rounds of "correct in code, broken in the room": audio-thread and transcription-worker races, device quirks, timing drift — each root-caused on live calls and fixed.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="hood">
+    <span class="kicker">05 · Under the hood</span>
+    <hr class="hr section-head">
+    <div class="hood-grid">
+      <div>
+        <h2>Two processes, two operating systems, one socket</h2>
+        <p>WSL cannot see native Windows system audio, so capture has to live on Windows — but the speech-to-text stack and the Claude CLI session want a Linux home. Feasibility testing ruled out the simpler single-process design, so Adarna is deliberately split: a native Windows GUI and audio process talking to a WSL worker over a local TCP socket.</p>
+        <p>The socket carries audio segments one way and streamed suggestion tokens the other. The Claude session is long-lived, so conversation context accumulates instead of being re-sent.</p>
+      </div>
+      <div style="display:grid; gap:20px;">
+        <div class="hood-procs">
+          <div class="blueprint">
+            <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <span class="proc-label">Process A · Windows (native)</span>
+            <ul>
+              <li>WASAPI loopback capture — system audio</li>
+              <li>Microphone capture, parallel stream</li>
+              <li>WebRTC VAD segmentation</li>
+              <li>PySide6 overlay + hotkey listener</li>
+              <li>Audio thread ↔ worker synchronization</li>
+            </ul>
+          </div>
+          <div class="hood-arrow">
+            <span>TCP socket<br>localhost</span>
+            <svg width="88" height="26" viewBox="0 0 88 26" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 8h78"></path><path d="m74 3 6 5-6 5"></path><path d="M86 20H8"></path><path d="m14 15-6 5 6 5"></path></svg>
+            <span>segments out<br>tokens back</span>
+          </div>
+          <div class="blueprint">
+            <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <span class="proc-label">Process B · WSL2</span>
+            <ul>
+              <li>faster-whisper speech-to-text</li>
+              <li>Hallucination-defense filtering</li>
+              <li>Dual-stream merge + speaker labeling</li>
+              <li>Mode-aware prompt construction</li>
+              <li>Long-lived Claude CLI session</li>
+            </ul>
+          </div>
+        </div>
+        <div class="blueprint transcript-sample">
+          <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+          <span class="sample-title">Dual-source transcript — merged in spoken order</span>
+          <div class="transcript-line">
+            <span>t+00:41</span><span class="source">Loopback</span><span class="text">"…so how are you handling the audio side of it?"</span>
+          </div>
+          <div class="transcript-line">
+            <span>t+00:44</span><span class="source you">Mic</span><span class="text">"Two streams, actually —"</span>
+          </div>
+          <div class="transcript-line">
+            <span>t+00:46</span><span class="source">Loopback</span><span class="text">"Right, and you keep them apart?"</span>
+          </div>
+          <p class="sample-note">Each source is transcribed and ordered independently, then interleaved by segment start time and relabeled "You" / "Them" before the prompt is built.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-label="Built with">
+    <span class="kicker">06 · Built with</span>
+    <hr class="hr section-head" style="margin-bottom: 24px;">
+    <div class="tags-row">
+      <span class="tag">Python</span>
+      <span class="tag">PySide6 / Qt</span>
+      <span class="tag">faster-whisper</span>
+      <span class="tag">WebRTC VAD</span>
+      <span class="tag">Claude Code CLI</span>
+      <span class="tag">WASAPI loopback</span>
+      <span class="tag">WSL2</span>
+      <span class="tag">TCP socket IPC</span>
+    </div>
+  </section>
+
+  <section style="padding-bottom: 32px;">
+    <hr class="hr" style="margin-bottom: 32px;">
+    <div class="closing-grid">
+      <div>
+        <h2>Want the long version?</h2>
+        <p>The repository carries the architecture notes, the feasibility write-up that killed the single-process design, and the failure log from live testing. Happy to walk through any of it.</p>
+      </div>
+      <div class="closing-ctas">
+        <a class="btn btn-primary" href="https://github.com/jjaguilar08/adarna-ai" target="_blank" rel="noopener">GitHub repository</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>Adarna — a real-time conversation copilot. Designed and built solo.</span>
+    <span>Named for the Adarna bird of Filipino folklore.</span>
+  </footer>
+</div>
+
+</body>
+</html>

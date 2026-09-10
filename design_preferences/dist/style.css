@@ -1,0 +1,611 @@
+/* Adarna landing page — DARK variant of style.css. Same components, same
+   structure; only the token values (and the handful of hardcoded colors
+   noted inline below) flip for a dark ground -- see style.css for the
+   light original and the component comments this file doesn't repeat. */
+
+:root {
+  --color-bg: #17181a;
+  --color-surface: #1f2124;
+  --color-text: #ececed;
+  --color-divider: rgba(236, 237, 237, 0.16);
+
+  --color-neutral-600: #9d9da1;
+  --color-neutral-700: #b8b8bb;
+  --color-neutral-800: #d8d8da;
+
+  /* Same brand hue as the light theme, just re-tuned so each role still
+     contrasts against a dark ground instead of a light one: --color-accent
+     stays the fill color used behind on-accent (light) text, so it's a
+     touch brighter than light mode's #5980a6; --color-accent-700 is now the
+     LIGHT tint used for label/link text against dark backgrounds (in light
+     mode that role needed a darker tint instead); --color-accent-900
+     (link hover) goes lighter-still, mirroring how light mode goes darker. */
+  --color-accent: #6f97ba;
+  --color-on-accent: #f2f4f6;
+  --color-accent-100: #16222c;
+  --color-accent-700: #9cc2e4;
+  --color-accent-800: #bcd8ee;
+  --color-accent-900: #d8ebf9;
+
+  --font-heading: "Barlow Condensed", system-ui, sans-serif;
+  --font-body: "Barlow", system-ui, sans-serif;
+
+  --max-width: 1180px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+h1, h2, h3, h4 {
+  font-family: var(--font-heading);
+  font-weight: 600;
+  line-height: 1.1;
+  margin: 0;
+}
+
+p {
+  margin: 0;
+}
+
+a {
+  color: var(--color-accent-700);
+  text-decoration: none;
+}
+a:hover {
+  color: var(--color-accent-900);
+  text-decoration: underline;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+}
+
+.wrap {
+  max-width: var(--max-width);
+  margin: 0 auto;
+  padding: 0 clamp(20px, 5vw, 64px);
+}
+
+.hr {
+  height: 1px;
+  border: 0;
+  margin: 0;
+  background: var(--color-divider);
+}
+
+.kicker {
+  display: block;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+  margin: 0 0 12px;
+}
+
+/* — buttons — */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  cursor: pointer;
+  text-decoration: none;
+  font-family: var(--font-heading);
+  font-weight: 600;
+  font-size: 14px;
+  border-radius: 0;
+  padding: 10px 18px;
+  border: 1px solid var(--color-divider);
+}
+.btn:hover {
+  text-decoration: none;
+}
+.btn-primary {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+  border-color: var(--color-accent);
+}
+.btn-primary:hover {
+  background: var(--color-accent-700);
+}
+.btn-ghost {
+  color: var(--color-accent-700);
+  border-color: transparent;
+}
+.btn-ghost:hover {
+  background: rgba(111, 151, 186, 0.16);
+}
+
+/* — tags — */
+.tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 5px 12px;
+  border: 1px solid var(--color-accent);
+  color: var(--color-accent-700);
+}
+
+/* — blueprint frame: square, transparent, hairline-bordered, with small
+   corner-bracket registration marks — the mockup's signature detail. — */
+.blueprint {
+  position: relative;
+  border: 1px solid var(--color-divider);
+}
+.blueprint > .corner {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  color: rgba(236, 237, 237, 0.55);
+}
+.blueprint > .corner::before,
+.blueprint > .corner::after {
+  content: "";
+  position: absolute;
+  background: currentColor;
+}
+.blueprint > .corner::before { left: 5px; top: 0; width: 1px; height: 100%; }
+.blueprint > .corner::after { top: 5px; left: 0; width: 100%; height: 1px; }
+.blueprint > .corner.tl { top: -6px; left: -6px; }
+.blueprint > .corner.tr { top: -6px; right: -6px; }
+.blueprint > .corner.bl { bottom: -6px; left: -6px; }
+.blueprint > .corner.br { bottom: -6px; right: -6px; }
+
+/* — nav — */
+.nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  row-gap: 10px;
+  column-gap: clamp(16px, 4vw, 32px);
+  padding: 20px clamp(20px, 5vw, 64px);
+}
+@media (max-width: 640px) {
+  .nav-brand { width: 100%; margin-right: 0; }
+}
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--font-heading);
+  font-weight: 600;
+  font-size: 18px;
+  margin-right: auto;
+}
+.nav a:not(.btn) {
+  color: inherit;
+  font-size: 14px;
+}
+.nav a:not(.btn):hover {
+  color: var(--color-accent-700);
+  text-decoration: none;
+}
+
+/* — hero — */
+.hero {
+  padding: 64px 0 72px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 40px clamp(32px, 5vw, 72px);
+  align-items: center;
+}
+/* Grid/flex items default to min-width:auto, whose min-content size for a
+   replaced element (img) is its intrinsic pixel size regardless of any
+   width:100% CSS -- without this override, the overlay screenshot's native
+   440px width forces this column (and the whole page) wider than a narrow
+   viewport, clipping everything else instead of wrapping. */
+.hero > *, .shots-grid > * {
+  min-width: 0;
+}
+.hero h1 {
+  font-size: clamp(38px, 5.4vw, 72px);
+  letter-spacing: 0.01em;
+  text-transform: uppercase;
+  margin: 0 0 24px;
+  margin-left: -0.03em;
+  overflow-wrap: break-word;
+}
+.hero .eyebrow {
+  display: block;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+  margin: 0 0 12px;
+}
+.hero .lede {
+  font-size: 17px;
+  line-height: 1.6;
+  max-width: 52ch;
+  margin: 0 0 16px;
+}
+.hero .sub {
+  font-size: 15px;
+  line-height: 1.6;
+  max-width: 52ch;
+  color: var(--color-neutral-700);
+  margin: 0;
+}
+.hero-ctas {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 32px;
+}
+
+.overlay-frame {
+  margin: 0;
+  /* Fixed, not tied to --color-neutral-800 (that token is light in this
+     theme, for body text) -- this chrome wraps a screenshot that's itself
+     a near-black panel, so it stays a fixed dark tone regardless of theme. */
+  background: #1b1c1e;
+}
+.overlay-frame header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--color-divider);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: #d8d8da;
+}
+.overlay-frame header .dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7ea7cf;
+  margin-right: 8px;
+  animation: adarna-pulse 1.8s ease-in-out infinite;
+}
+@keyframes adarna-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+.overlay-frame img {
+  width: 100%;
+  display: block;
+}
+figcaption {
+  font-size: 12px;
+  margin-top: 10px;
+  color: var(--color-neutral-700);
+}
+
+/* — system characteristics strip — */
+.stats {
+  padding: 0;
+}
+.stats-header {
+  display: flex;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--color-divider);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.stats-header span {
+  padding: 12px 24px;
+}
+.stats-header span + span {
+  border-left: 1px solid var(--color-divider);
+  color: var(--color-neutral-700);
+  white-space: nowrap;
+}
+.stats-header span:first-child {
+  flex: 1;
+  min-width: 16ch;
+}
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+@media (max-width: 760px) {
+  .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+.stats-grid > div {
+  padding: 20px 24px;
+  border-left: 1px solid var(--color-divider);
+}
+.stats-grid > div:first-child {
+  border-left: none;
+}
+.stats-grid .stat-label {
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+}
+.stats-grid .stat-value {
+  display: block;
+  font-family: var(--font-heading);
+  font-weight: 600;
+  font-size: 32px;
+  line-height: 1.2;
+  margin-top: 6px;
+}
+.stats-grid .stat-caption {
+  display: block;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--color-neutral-700);
+}
+.stats-footnote {
+  margin: 0;
+  padding: 12px 24px;
+  border-top: 1px solid var(--color-divider);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-neutral-700);
+}
+
+/* — section shell — */
+section {
+  padding: 72px 0;
+}
+section.tight {
+  padding-top: 24px;
+}
+.section-head {
+  margin-bottom: 32px;
+}
+
+/* — screenshots showcase — */
+.shots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: clamp(24px, 3vw, 48px);
+  align-items: start;
+}
+.shots-grid figure {
+  margin: 0;
+  background: #101112;
+}
+.shots-grid img {
+  width: 100%;
+}
+
+/* — how it works — */
+.steps-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: clamp(24px, 3vw, 40px);
+}
+.step {
+  padding: 24px;
+}
+.step .step-index {
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+}
+.step h3 {
+  font-size: 26px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin: 10px 0 0;
+}
+.step p {
+  font-size: 15px;
+  line-height: 1.6;
+  margin: 12px 0 0;
+  color: var(--color-neutral-800);
+}
+.step .tech-note {
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 16px 0 0;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-divider);
+  color: var(--color-neutral-700);
+}
+
+/* — feature highlights — */
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: clamp(24px, 3vw, 40px);
+}
+.feature-card {
+  padding: 24px;
+}
+.feature-card h3 {
+  font-size: 22px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  margin: 0;
+}
+.feature-card p {
+  font-size: 15px;
+  line-height: 1.6;
+  margin: 12px 0 0;
+  color: var(--color-neutral-800);
+}
+
+/* — under the hood — */
+.hood-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 4fr) minmax(0, 8fr);
+  gap: 32px clamp(32px, 5vw, 72px);
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .hood-grid { grid-template-columns: 1fr; }
+}
+.hood-grid h2 {
+  font-size: 32px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.hood-grid > div:first-child p {
+  font-size: 15px;
+  line-height: 1.6;
+  margin-top: 20px;
+  color: var(--color-neutral-800);
+}
+.hood-procs {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 16px;
+  align-items: stretch;
+}
+@media (max-width: 560px) {
+  .hood-procs { grid-template-columns: 1fr; }
+}
+.hood-procs .blueprint {
+  padding: 20px;
+}
+.hood-procs .proc-label {
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+}
+.hood-procs ul {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.hood-procs li {
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--color-divider);
+}
+.hood-procs li:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.hood-arrow {
+  display: grid;
+  place-items: center;
+  gap: 8px;
+  min-width: 96px;
+  align-content: center;
+  text-align: center;
+}
+.hood-arrow span {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--color-neutral-700);
+}
+.hood-arrow svg {
+  color: var(--color-accent);
+}
+.transcript-sample {
+  padding: 20px 24px;
+  margin-top: 20px;
+}
+.transcript-sample .sample-title {
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--color-accent-700);
+  margin-bottom: 14px;
+}
+.transcript-line {
+  display: grid;
+  grid-template-columns: 62px 62px minmax(0, 1fr);
+  gap: 12px;
+  align-items: baseline;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--color-neutral-700);
+}
+.transcript-line + .transcript-line {
+  margin-top: 8px;
+}
+.transcript-line .source {
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.transcript-line .source.you {
+  color: var(--color-accent-700);
+}
+.transcript-line .text {
+  color: var(--color-text);
+}
+.transcript-sample .sample-note {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-divider);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-neutral-700);
+}
+
+/* — built with — */
+.tags-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* — closing / repo — */
+.closing-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 24px clamp(32px, 5vw, 72px);
+  align-items: end;
+}
+.closing-grid h2 {
+  font-size: 28px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.closing-grid p {
+  font-size: 15px;
+  line-height: 1.6;
+  margin-top: 14px;
+  max-width: 56ch;
+  color: var(--color-neutral-800);
+}
+.closing-ctas {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+  justify-content: space-between;
+  padding: 24px 0 48px;
+  border-top: 1px solid var(--color-divider);
+  font-size: 13px;
+  color: var(--color-neutral-700);
+}
