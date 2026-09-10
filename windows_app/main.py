@@ -10,15 +10,14 @@ from pathlib import Path
 
 import pyaudiowpatch as pyaudio
 from pynput import keyboard
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextBlockFormat
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QIcon, QPainter, QPen, QTextBlockFormat
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -26,7 +25,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QScrollArea,
     QSizeGrip,
     QSlider,
     QTextEdit,
@@ -1048,13 +1046,12 @@ class _DragHandle(QWidget):
     particular bug in this file's version of the pattern -- multiple
     Qt Forum threads report the same "only works one level deep, not
     reliably through nested children" behavior. A dedicated drag handle
-    sidesteps the whole class of problem: dragging and scrolling are now
-    two separate widgets, each handled by Qt's own normal, un-hacked event
-    delivery (see _build_scroll_area(), which is now a plain interactive
-    QScrollArea with its own real scrollbar and real wheel scrolling, no
-    transparency tricks at all). The trade-off -- the panel is now
-    draggable only from this strip and its margins, not from anywhere you
-    click -- is the standard pattern for overlay/HUD-style windows anyway.
+    sidesteps the whole class of problem: dragging is its own widget,
+    fully separate from the answer text underneath (which, since Day 30,
+    doesn't scroll at all any more -- see _resize_to_fit_content()). The
+    trade-off -- the panel is now draggable only from this strip and its
+    margins, not from anywhere you click -- is the standard pattern for
+    overlay/HUD-style windows anyway.
     """
 
     def __init__(self, overlay_window):
@@ -1095,8 +1092,14 @@ class OverlayWindow(QWidget):
     settings, no session controls either -- those all stay on the main
     window). Starts hidden; create_overlay_toggle() wires up the hotkey
     that shows it. Dragged only via the _DragHandle strip docked at its
-    top (see that class's docstring for why); its body is a plain,
-    un-hacked QScrollArea.
+    top (see that class's docstring for why).
+
+    No scrollbar (removed Day 30, per direct user feedback that it wasn't
+    wanted): the window's own height instead always grows or shrinks to
+    exactly fit the current suggestion at whatever width the user has
+    dragged it to, so the black panel painted in paintEvent() visibly
+    "follows" the length of the text rather than clipping it or making it
+    scrollable -- see _resize_to_fit_content().
 
     A real class (not a plain QWidget built by a factory function, like
     every other widget in this file) because dragging and the rounded/
@@ -1139,6 +1142,9 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMinimumSize(260, 140)
         self._drag_offset = None
+        # Guards against _resize_to_fit_content()'s own self.resize() call
+        # re-entering resizeEvent() -- see that method's docstring.
+        self._fitting_content = False
         # Multiplies OVERLAY_BACKGROUND_RGBA/BORDER_RGBA's own alpha in
         # paintEvent() -- see set_opacity(). Text is deliberately NOT
         # affected by this (see that method's docstring): an assistive
@@ -1152,7 +1158,7 @@ class OverlayWindow(QWidget):
         outer_layout.setSpacing(4)
 
         outer_layout.addWidget(_DragHandle(self))
-        outer_layout.addWidget(self._build_scroll_area())
+        outer_layout.addWidget(self._build_answer_section())
 
         grip_row = QHBoxLayout()
         grip_row.addStretch()
@@ -1161,99 +1167,29 @@ class OverlayWindow(QWidget):
         grip_row.addWidget(grip)
         outer_layout.addLayout(grip_row)
 
-        # One reused single-shot timer for _sync_scroll_content_width
-        # (see resizeEvent()), rather than a fresh QTimer.singleShot(0, ...)
-        # per resize event -- dragging the QSizeGrip fires many resizeEvent
-        # calls in quick succession (one per intermediate geometry change),
-        # and re-starting an already-pending single-shot timer just pushes
-        # its fire time out rather than queuing a second one, so only the
-        # last resize in a burst actually triggers a resync. Found by
-        # /code-review, Day 18.
-        self._scroll_width_sync_timer = QTimer(self)
-        self._scroll_width_sync_timer.setSingleShot(True)
-        self._scroll_width_sync_timer.setInterval(0)
-        self._scroll_width_sync_timer.timeout.connect(self._sync_scroll_content_width)
-
-        # Sized last, once self._scroll_area/self._scroll_content exist --
-        # resize() fires resizeEvent() immediately, which reads both (see
-        # resizeEvent()'s docstring).
+        # Sized last -- resize() fires resizeEvent() immediately, which
+        # calls _resize_to_fit_content() (see that method's docstring),
+        # so the layout above needs to already exist.
         self.resize(440, 240)
 
-    def _build_scroll_area(self):
+    def _build_answer_section(self):
         """
-        Builds the scrollable content area holding the question and answer
-        sections. A real QScrollArea, not just word-wrapped labels left to
-        grow the window -- an earlier version tried growing the window to
-        fit instead, but that had no ceiling (a long enough question could
-        grow the overlay taller than the screen) and gave no way to recover
-        text if the user shrank the window smaller than the current content
-        needed (/code-review, Day 18: confirmed empirically that a plain
-        QLabel just silently stops drawing text past its allocated rect,
-        with no scrollbar or indicator anything is missing). A scroll area
-        fixes both at once: content that doesn't fit is always reachable by
-        scrolling, no matter how long the text or how small the user drags
-        the window, and the window's own size goes back to being purely
-        user-controlled (drag/resize), not something update_suggestion()
-        also reaches in and changes.
-
-        Its background and its viewport's background are set transparent
-        so the dark rounded panel painted on the window itself (see
-        __init__) shows through underneath. Otherwise this is a plain,
-        un-hacked QScrollArea: its real vertical scrollbar is left on
-        (styled to match the dark panel) and the mouse wheel scrolls it
-        natively -- neither needs any custom code, because nothing in this
-        subtree is mouse-transparent any more. The first Day 18 attempt
-        made the whole scroll area, its viewport, the content widget, and
-        both labels mouse-transparent so a click would fall through to
-        this window's own mousePressEvent and start a drag from anywhere
-        on the panel; that also silently disabled the scroll area's own
-        scrollbar and wheel handling (both go through the same hit-testing
-        a click does), and live testing found the fall-through itself
-        didn't reliably work either -- a documented Qt quirk
-        (QTBUG-8431), not just a bug in that particular wiring. Dragging
-        now happens only via the dedicated _DragHandle strip docked above
-        this (see its docstring), so this scroll area can just be a normal
-        interactive widget.
+        Builds the plain (non-scrolling) content area holding the answer
+        section: a marker caption plus the word-wrapped answer label.
+        Nothing here scrolls or clips -- see _resize_to_fit_content() for
+        how the window's own height is kept matching whatever this needs
+        to show in full.
 
         Returns:
-            QScrollArea: ready to add to the window's layout.
+            QWidget: ready to add to the window's layout.
         """
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.NoFrame)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setStyleSheet(
-            "QScrollArea { background: transparent; border: none; }"
-            "QScrollBar:vertical { background: transparent; width: 8px; margin: 0; }"
-            "QScrollBar::handle:vertical { background: rgba(255, 255, 255, 70); border-radius: 4px; min-height: 20px; }"
-            "QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }"
-            "QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }"
-        )
-        scroll_area.viewport().setStyleSheet("background: transparent;")
-        # setWidgetResizable(True) alone doesn't reliably let a
-        # height-for-width widget (word-wrapped QLabels) grow taller than
-        # the viewport -- confirmed empirically (/code-review, Day 18): it
-        # just clamped the content widget to the viewport's exact size
-        # instead of scrolling, even though the labels' own
-        # heightForWidth() said they needed much more room. Pinning the
-        # content widget's width to the viewport's current width (see
-        # resizeEvent()) forces its height to come from its own
-        # sizeHint() at that fixed width instead, which is what actually
-        # lets the scroll area detect the overflow and become scrollable.
-        self._scroll_area = scroll_area
-
         content = QWidget()
         content_layout = QVBoxLayout(content)
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(2)
 
         self._answer_label = self._add_labeled_section(content_layout, OVERLAY_ANSWER_MARKER)
-        content_layout.addStretch()
-
-        scroll_area.setWidget(content)
-        self._scroll_content = content
-        return scroll_area
+        return content
 
     def _add_labeled_section(self, layout, marker_text):
         """
@@ -1262,9 +1198,9 @@ class OverlayWindow(QWidget):
         word-wrapped text label beneath it to `layout`. Only one section
         now (Day 27 -- the "question"/transcript-excerpt section was
         dropped), but kept as its own method rather than inlined into
-        _build_scroll_area(), since a second section is a plausible future
-        addition and the marker+label pairing is a distinct enough unit to
-        stay named.
+        _build_answer_section(), since a second section is a plausible
+        future addition and the marker+label pairing is a distinct enough
+        unit to stay named.
 
         Returns:
             QLabel: the (initially empty) text label to keep updated.
@@ -1296,17 +1232,9 @@ class OverlayWindow(QWidget):
         return text_label
 
     def update_suggestion(self, answer):
-        """Updates the overlay's answer text to a newly received suggestion -- see _build_scroll_area() for how text longer than the window's current size stays reachable rather than getting clipped."""
+        """Updates the overlay's answer text to a newly received suggestion, then re-fits the window's height to it -- see _resize_to_fit_content()."""
         self._answer_label.setText(answer)
-        # New text can make the scroll area's real vertical scrollbar
-        # appear or disappear (see _build_scroll_area()'s ScrollBarAsNeeded
-        # policy), which changes the viewport's width -- but that only
-        # happens as a side effect of this text change, not a window
-        # resize, so resizeEvent() never fires on its own to trigger a
-        # resync. Reuse the same deferred timer resizeEvent() uses (see
-        # its docstring for why this needs to be deferred a tick rather
-        # than read synchronously). Found by /code-review, Day 18.
-        self._scroll_width_sync_timer.start()
+        self._resize_to_fit_content()
 
     def set_opacity(self, opacity):
         """
@@ -1397,43 +1325,79 @@ class OverlayWindow(QWidget):
 
     def resizeEvent(self, event):
         """
-        Whenever the window's own size actually changes (drag-resize via
-        the grip, or the initial show), re-pins the scrollable content's
-        width to the scroll area's current viewport width -- see
-        _build_scroll_area()'s docstring for why this needs to happen
-        explicitly rather than trusting setWidgetResizable(True) alone.
-
-        Deferred one event-loop tick via self._scroll_width_sync_timer
-        (a reused single-shot timer, not read synchronously right here:
-        confirmed empirically (/code-review, Day 18) that reading
-        self._scroll_area.viewport().width() immediately inside
-        resizeEvent() returns a stale value -- Qt hadn't yet finished
-        cascading the window's new size down into the scroll area's own
-        child layout at that point, so every read kept returning an old
-        (or, before the first real show, a not-yet-laid-out default) width
-        instead of the current one. Giving Qt's event loop one more turn
-        before reading it is the standard way around this class of Qt
-        layout-timing gap. Restarting the same timer (rather than firing a
-        fresh QTimer.singleShot(0, ...) each time) also debounces a rapid
-        burst of resizeEvent calls -- e.g. dragging the QSizeGrip -- down
-        to one actual resync instead of one per intermediate frame.
+        Whenever the window's width changes (drag-resize via the grip, or
+        the initial show), re-fits the window's height to the current
+        answer text at that new width -- see _resize_to_fit_content() for
+        why height always follows content now that there's no scrollbar.
         """
         super().resizeEvent(event)
-        self._scroll_width_sync_timer.start()
+        if not self._fitting_content:
+            self._resize_to_fit_content()
 
-    def _sync_scroll_content_width(self):
+    def _resize_to_fit_content(self):
         """
-        Pins the scrollable content's width to the scroll area's own
-        viewport width -- see resizeEvent()'s docstring for why this runs
-        deferred rather than synchronously during the resize. Reading the
-        viewport's width directly is safe here (rather than reserving
-        space defensively the way an early version of this method had to):
-        the scroll area's own vertical scrollbar is permanently off (see
-        _build_scroll_area()), so nothing ever shrinks the viewport out
-        from under this value the way a just-appearing internal scrollbar
-        once did.
+        Grows or shrinks the window so its height exactly fits the answer
+        text at the window's current width -- no scrollbar, no clipped
+        text. Replaces the earlier QScrollArea-based approach (removed
+        Day 30) per direct user feedback that the scrollbar wasn't
+        wanted: the black panel painted in paintEvent() just follows
+        whatever size this method settles on, so a long suggestion visibly
+        grows the panel instead of becoming scrollable.
+
+        Measures the wrapped answer text's own height directly with
+        QFontMetrics (no width-dependent caching quirks, confirmed by a
+        throwaway probe script against the real running overlay -- unlike
+        QLayout.sizeHint(), which is reliable for everything else here but
+        specifically lags one call behind for a size-hint change coming
+        purely from a child's setFixedHeight(), see below), then adds that
+        to a freshly-measured "everything except the answer label" chrome
+        height (drag handle, caption, margins, spacing, grip row) to get
+        the window's true target height.
+
+        Clamped to the current screen's available height so one very long
+        suggestion can't grow the overlay taller than the screen; unlike
+        the old scroll-free attempt this replaces, there's no stuck state
+        if the clamp kicks in -- the next suggestion re-fits normally.
+
+        self._fitting_content guards the self.resize() call below from
+        re-entering resizeEvent(), which calls this method again.
         """
-        self._scroll_content.setFixedWidth(self._scroll_area.viewport().width())
+        margins = self.layout().contentsMargins()
+        content_width = max(self.width() - margins.left() - margins.right(), 0)
+
+        # Measures the layout's currently-settled total height and the
+        # answer label's currently-settled height BEFORE changing
+        # anything below, giving "everything except the answer label" as
+        # a height, valid right now since nothing's been mutated yet this
+        # call. Reading self.layout().sizeHint() AFTER changing the
+        # label's own setFixedHeight() instead hits a real Qt staleness
+        # bug, confirmed directly (a throwaway probe script against the
+        # real running overlay): it lags exactly one call behind, so a
+        # longer suggestion arriving right after a shorter one measured
+        # as if it were still the shorter one's height. Doing the
+        # subtraction up front, before mutating the label, sidesteps that
+        # entirely -- self._answer_label.height() here is the label's
+        # actual current geometry, not a cached hint, so it's always
+        # accurate.
+        self.layout().activate()
+        chrome_height = self.layout().sizeHint().height() - self._answer_label.height()
+
+        metrics = QFontMetrics(self._answer_label.font())
+        wrapped_rect = metrics.boundingRect(
+            0, 0, content_width, 0, Qt.TextWordWrap, self._answer_label.text()
+        )
+        self._answer_label.setFixedWidth(content_width)
+        self._answer_label.setFixedHeight(wrapped_rect.height())
+
+        target_height = chrome_height + wrapped_rect.height()
+        screen = self.screen()
+        if screen is not None:
+            target_height = min(target_height, screen.availableGeometry().height())
+        self._fitting_content = True
+        try:
+            self.resize(self.width(), target_height)
+        finally:
+            self._fitting_content = False
 
 
 def create_overlay_window():

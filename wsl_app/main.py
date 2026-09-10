@@ -1006,6 +1006,32 @@ CONTENT_NOT_OUTLINE_INSTRUCTION = (
     "instead."
 )
 
+# Shared by both mode instructions, same as CONTENT_NOT_OUTLINE_
+# INSTRUCTION and IGNORE_TRANSCRIPT_NOISE_INSTRUCTION above. Added Day 30,
+# from direct user feedback on real suggestions: the wording was coming
+# back correct but genuinely hard to say out loud mid-conversation -- the
+# user's own example was "intermediary" -- plus a separate complaint about
+# em dashes showing up in the text. Both are writing habits, not things
+# anyone actually says out loud, which is exactly the gap this app's
+# suggestions need to close, since they're meant to be spoken live, not
+# read silently. Same lesson as CONTENT_NOT_OUTLINE_INSTRUCTION's own Day
+# 19 history: a concrete good/bad example is what actually changes model
+# behavior here, not an abstract adjective like "natural" or
+# "conversational" on its own.
+SPEAKABLE_WORDING_INSTRUCTION = (
+    "Every word must be easy to actually say out loud in a live "
+    "conversation, not just easy to read silently. Avoid stiff, formal, "
+    "or overly technical vocabulary whenever a simpler everyday word or "
+    "phrase means the same thing -- for example, don't write "
+    "\"intermediary\", say \"go-between\", or just describe what it does "
+    "(\"something that sits in between and passes messages along\"). "
+    "Never use an em dash (—) anywhere in the answer -- that's a writing "
+    "habit, not something anyone actually says out loud; use a period, a "
+    "comma, or \"and\"/\"but\" instead. Prefer short, plain, "
+    "conversational phrasing throughout, even when the topic itself is "
+    "technical."
+)
+
 # The framing given to every prompt sent through a session's ClaudeCli,
 # chosen per session by mode (see MeetingSession). Both end with the same
 # instruction. Originally (Day 6) this asked for a single ready-to-read
@@ -1040,6 +1066,7 @@ RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION = (
     "verbatim. Keep the lead and each bullet short enough to skim in a few "
     "seconds; no meta-commentary, no multiple alternative versions.\n\n"
     + CONTENT_NOT_OUTLINE_INSTRUCTION + "\n\n"
+    + SPEAKABLE_WORDING_INSTRUCTION + "\n\n"
     + IGNORE_TRANSCRIPT_NOISE_INSTRUCTION
 )
 
@@ -1109,6 +1136,7 @@ INTERVIEW_RESPOND_INSTRUCTION = (
     "-- meant to be read nearly as-is, not a skimmable list of options. No "
     "meta-commentary, no multiple alternative versions.\n\n"
     + CONTENT_NOT_OUTLINE_INSTRUCTION + "\n\n"
+    + SPEAKABLE_WORDING_INSTRUCTION + "\n\n"
     + IGNORE_TRANSCRIPT_NOISE_INSTRUCTION
 )
 

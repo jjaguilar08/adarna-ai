@@ -11,6 +11,19 @@
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# wsl_app spawns the `claude` CLI via `subprocess.Popen(["claude", ...])`,
+# which needs `claude` on PATH. `claude` lives under nvm's per-version bin
+# directory, which normally gets onto PATH via ~/.bashrc -- but the Day 28
+# double-click launcher runs this script through `bash -lc`, a
+# non-interactive login shell, and Ubuntu's default ~/.bashrc bails out
+# early for non-interactive shells before it ever reaches the nvm lines.
+# Without this, `claude` silently isn't on PATH and wsl_app fails to start
+# a session with a "Claude not found" error. Loading nvm directly here
+# works regardless of how this script itself was invoked.
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"
+
 IPC_PORT="$(python3 -c 'import json; print(json.load(open("ipc_config.json"))["port"])')"
 
 # A previous run that was killed uncleanly (closed terminal, dropped WSL
