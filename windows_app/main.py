@@ -129,6 +129,10 @@ DEFAULT_SUGGESTION_PAUSE_SECONDS = SUGGESTION_PAUSE_PRESETS_SECONDS[1]
 OVERLAY_BACKGROUND_RGBA = (0, 0, 0, 200)
 OVERLAY_BORDER_RGBA = (255, 255, 255, 30)
 OVERLAY_ANSWER_MARKER = "⭐️"  # ⭐️
+# Marker for the overlay's questions section (Day 32, "Suggest Questions"
+# feature) -- a plain "?" glyph this app draws itself, same non-model-output
+# role as OVERLAY_ANSWER_MARKER above.
+OVERLAY_QUESTIONS_MARKER = "❓"  # ❓
 OVERLAY_TEXT_COLOR = "#FFFFFF"
 
 # Range and default for the overlay opacity slider (see
@@ -186,13 +190,15 @@ class WslConnection(QObject):
     socket, guarded by a lock so writes never interleave. See wsl_app/main.py
     for the full set of message types this protocol carries: ping/pong,
     audio_chunk, session_started/session_stopped, session_start_failed,
-    hotkey_triggered, settings_changed, auto_suggest_changed, transcript,
-    suggestion, generate_summary, summary, and summary_failed.
+    hotkey_triggered, questions_triggered, settings_changed,
+    auto_suggest_changed, transcript, suggestion, questions,
+    generate_summary, summary, and summary_failed.
     """
 
     connection_changed = Signal(bool)
     transcript_received = Signal(str, str, float)  # source, text, started_at
     suggestion_received = Signal(str, str)
+    questions_received = Signal(str, str)
     session_start_failed_received = Signal(str, int)
     summary_received = Signal(str)
     summary_failed_received = Signal(str)
@@ -272,7 +278,12 @@ class WslConnection(QObject):
         (for an attempt already abandoned in favor of a newer one) from a
         current one. summary/summary_failed (Day 23) are forwarded the same
         defensive way as suggestion's "question" field above, in case a
-        field is ever missing or explicitly null.
+        field is ever missing or explicitly null. "questions" (Day 32,
+        the "Suggest Questions" feature) is forwarded the exact same way
+        suggestion is -- same "question"/"text" field shape, since
+        wsl_app's request_questions() sends it as one -- just onto its own
+        questions_received signal so a questions answer never gets
+        confused for, or overwrites, a real suggestion.
         """
         while True:
             line = self._connection.readline()
@@ -285,6 +296,8 @@ class WslConnection(QObject):
                 )
             elif message.get("type") == "suggestion":
                 self.suggestion_received.emit(message.get("question") or "", message["text"])
+            elif message.get("type") == "questions":
+                self.questions_received.emit(message.get("question") or "", message["text"])
             elif message.get("type") == "session_start_failed":
                 self.session_start_failed_received.emit(
                     message.get("reason", "Unknown error"), message.get("attempt_id", -1)
@@ -873,6 +886,32 @@ class SuggestionDisplay(QObject):
         self._overlay_window.update_suggestion(answer)
 
 
+class QuestionsDisplay(QObject):
+    """
+    Fans out one incoming "Suggest Questions" answer (Day 32) to everywhere
+    it's shown: the Suggestions window's own questions pane, and the
+    overlay's own questions section (see OverlayWindow.update_questions) --
+    entirely independent of SuggestionDisplay and its answer pane/section,
+    so a questions answer can never clobber a real suggestion, or vice
+    versa. A QObject with a bound-method slot, not a lambda, for the same
+    cross-thread reason as SuggestionDisplay above: questions_received is
+    emitted from WslConnection's background reader thread, and a lambda has
+    no owning QObject for Qt to marshal the call through safely (see
+    OverlayToggle.toggle for the fuller explanation of that rule).
+    """
+
+    def __init__(self, questions_pane, overlay_window):
+        """Stores the two things one incoming questions answer needs to update."""
+        super().__init__()
+        self._questions_pane = questions_pane
+        self._overlay_window = overlay_window
+
+    def update(self, question, answer):
+        """Updates the Suggestions window's questions pane and the overlay's questions section, both with the answer text -- question (the transcript excerpt that prompted it) is unused, matching SuggestionDisplay's own "question" field."""
+        self._questions_pane.setPlainText(answer)
+        self._overlay_window.update_questions(answer)
+
+
 class SummaryDisplay(QObject):
     """
     Keeps the summary pane, the Generate Summary button, and the Save
@@ -932,14 +971,14 @@ class SessionRecorder(QObject):
     is never written here or anywhere else, only the same transcript/
     suggestion text that already reaches this app over the wire.
 
-    record_transcript()/record_suggestion() match
-    WslConnection.transcript_received/suggestion_received's own signal
-    signatures exactly, so create_session_recording() can connect them
-    directly without an intermediate lambda -- consistent with this file's
-    rule that a cross-thread signal must reach a bound method, not a lambda
-    (see OverlayToggle.toggle). Both are safe no-ops while no file is open,
-    so they can stay connected for the app's whole lifetime rather than
-    being wired/unwired per session.
+    record_transcript()/record_suggestion()/record_questions() match
+    WslConnection.transcript_received/suggestion_received/questions_received's
+    own signal signatures exactly, so connect_session_recorder() can connect
+    them directly without an intermediate lambda -- consistent with this
+    file's rule that a cross-thread signal must reach a bound method, not a
+    lambda (see OverlayToggle.toggle). All three are safe no-ops while no
+    file is open, so they can stay connected for the app's whole lifetime
+    rather than being wired/unwired per session.
 
     Each line is flushed to disk as it's written, not buffered up to be
     written at the end, so a crash mid-session doesn't lose an otherwise-
@@ -980,6 +1019,14 @@ class SessionRecorder(QObject):
             return
         timestamp = time.strftime("%H:%M:%S")
         label = f'Suggestion (re: "{question}")' if question else "Suggestion"
+        self._write(f"[{timestamp}] {label}: {answer}")
+
+    def record_questions(self, question, answer):
+        """Appends one timestamped "Suggest Questions" answer (Day 32, with the transcript excerpt that prompted it, if any), if a session is currently being recorded -- same shape as record_suggestion(), just labeled "Questions" so it reads distinctly in the saved file."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        label = f'Questions (re: "{question}")' if question else "Questions"
         self._write(f"[{timestamp}] {label}: {answer}")
 
     def _write(self, line):
@@ -1094,6 +1141,15 @@ class OverlayWindow(QWidget):
     that shows it. Dragged only via the _DragHandle strip docked at its
     top (see that class's docstring for why).
 
+    Day 32 adds a second, independent section for the "Suggest Questions"
+    feature's own answer (marked ❓, see OVERLAY_QUESTIONS_MARKER and
+    update_questions()), plus a compact "Generate Suggestion"/"Questions"
+    button row (see _build_button_row()) just below the drag handle, so
+    both manual triggers are reachable straight from the overlay, not just
+    the main window. The questions section is sized and fitted exactly the
+    same way the answer section is (see _resize_to_fit_content()) -- both
+    grow or shrink the window together, independently of each other.
+
     No scrollbar (removed Day 30, per direct user feedback that it wasn't
     wanted): the window's own height instead always grows or shrinks to
     exactly fit the current suggestion at whatever width the user has
@@ -1158,7 +1214,9 @@ class OverlayWindow(QWidget):
         outer_layout.setSpacing(4)
 
         outer_layout.addWidget(_DragHandle(self))
+        outer_layout.addLayout(self._build_button_row())
         outer_layout.addWidget(self._build_answer_section())
+        outer_layout.addWidget(self._build_questions_section())
 
         grip_row = QHBoxLayout()
         grip_row.addStretch()
@@ -1171,6 +1229,41 @@ class OverlayWindow(QWidget):
         # calls _resize_to_fit_content() (see that method's docstring),
         # so the layout above needs to already exist.
         self.resize(440, 240)
+
+    def _build_button_row(self):
+        """
+        Builds the row of compact, minimally-styled action buttons (Day 32:
+        "Generate Suggestion" and "Questions") sitting just below the drag
+        handle -- plain sibling widgets, not part of _DragHandle's manual
+        event-forwarding chain, so Qt's normal childAt-based click dispatch
+        reaches them directly with no risk of being hijacked into a drag
+        (see _DragHandle's own docstring for the reason dragging needed a
+        dedicated widget in the first place). Styled small and low-chrome
+        to match the dark, rounded panel rather than clashing with default
+        Qt button styling. Exposes the buttons as self.generate_button/
+        self.questions_button so main() can wire their clicks once the
+        real request_suggestion_now/request_questions_now callables exist
+        (they're built later in main(), well after the overlay window
+        itself -- see that function's own construction-order comment).
+
+        Returns:
+            QHBoxLayout: ready to add to the window's outer layout.
+        """
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        button_style = (
+            f"QPushButton {{ color: {OVERLAY_TEXT_COLOR}; background: rgba(255, 255, 255, 30); "
+            "border: 1px solid rgba(255, 255, 255, 60); border-radius: 4px; "
+            "padding: 2px 8px; font-size: 11px; } "
+            "QPushButton:hover { background: rgba(255, 255, 255, 50); }"
+        )
+        self.generate_button = QPushButton("Generate Suggestion")
+        self.questions_button = QPushButton("Questions")
+        for button in (self.generate_button, self.questions_button):
+            button.setStyleSheet(button_style)
+            row.addWidget(button)
+        row.addStretch()
+        return row
 
     def _build_answer_section(self):
         """
@@ -1189,6 +1282,29 @@ class OverlayWindow(QWidget):
         content_layout.setSpacing(2)
 
         self._answer_label = self._add_labeled_section(content_layout, OVERLAY_ANSWER_MARKER)
+        return content
+
+    def _build_questions_section(self):
+        """
+        Builds the plain (non-scrolling) content area holding the questions
+        section (Day 32, "Suggest Questions") -- same shape as
+        _build_answer_section() above, a marker caption plus a word-wrapped
+        label, just for the questions answer instead of a real suggestion.
+        Kept as its own independently laid-out section rather than folded
+        into _build_answer_section(), so the two never overwrite each other
+        and can each be measured and sized independently -- see
+        _resize_to_fit_content(), which now fits both labels, not just the
+        answer one.
+
+        Returns:
+            QWidget: ready to add to the window's layout.
+        """
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(2)
+
+        self._questions_label = self._add_labeled_section(content_layout, OVERLAY_QUESTIONS_MARKER)
         return content
 
     def _add_labeled_section(self, layout, marker_text):
@@ -1234,6 +1350,11 @@ class OverlayWindow(QWidget):
     def update_suggestion(self, answer):
         """Updates the overlay's answer text to a newly received suggestion, then re-fits the window's height to it -- see _resize_to_fit_content()."""
         self._answer_label.setText(answer)
+        self._resize_to_fit_content()
+
+    def update_questions(self, answer):
+        """Updates the overlay's questions text to a newly received "Suggest Questions" answer (Day 32), then re-fits the window's height to it -- see _resize_to_fit_content()."""
+        self._questions_label.setText(answer)
         self._resize_to_fit_content()
 
     def set_opacity(self, opacity):
@@ -1336,28 +1457,37 @@ class OverlayWindow(QWidget):
 
     def _resize_to_fit_content(self):
         """
-        Grows or shrinks the window so its height exactly fits the answer
-        text at the window's current width -- no scrollbar, no clipped
-        text. Replaces the earlier QScrollArea-based approach (removed
-        Day 30) per direct user feedback that the scrollbar wasn't
-        wanted: the black panel painted in paintEvent() just follows
-        whatever size this method settles on, so a long suggestion visibly
-        grows the panel instead of becoming scrollable.
+        Grows or shrinks the window so its height exactly fits BOTH the
+        answer text and the questions text (Day 32) at the window's
+        current width -- no scrollbar, no clipped text. Replaces the
+        earlier QScrollArea-based approach (removed Day 30) per direct
+        user feedback that the scrollbar wasn't wanted: the black panel
+        painted in paintEvent() just follows whatever size this method
+        settles on, so a long suggestion or questions answer visibly grows
+        the panel instead of becoming scrollable.
 
-        Measures the wrapped answer text's own height directly with
+        Measures each label's own wrapped-text height directly with
         QFontMetrics (no width-dependent caching quirks, confirmed by a
         throwaway probe script against the real running overlay -- unlike
         QLayout.sizeHint(), which is reliable for everything else here but
         specifically lags one call behind for a size-hint change coming
-        purely from a child's setFixedHeight(), see below), then adds that
-        to a freshly-measured "everything except the answer label" chrome
-        height (drag handle, caption, margins, spacing, grip row) to get
-        the window's true target height.
+        purely from a child's setFixedHeight(), see below), then adds both
+        to a freshly-measured "everything except the two dynamically-sized
+        labels" chrome height (drag handle, button row, captions, margins,
+        spacing, grip row) to get the window's true target height. Both
+        labels are treated identically here -- this is NOT "chrome is
+        everything but the answer label": the button row genuinely is
+        fixed-height and correctly falls under chrome for free, but the
+        questions label is just as dynamically-sized as the answer label
+        and must be measured and fitted the same way, or its height gets
+        wrongly absorbed into "chrome" and the window clips it or leaves
+        stale blank space.
 
         Clamped to the current screen's available height so one very long
-        suggestion can't grow the overlay taller than the screen; unlike
-        the old scroll-free attempt this replaces, there's no stuck state
-        if the clamp kicks in -- the next suggestion re-fits normally.
+        suggestion or questions answer can't grow the overlay taller than
+        the screen; unlike the old scroll-free attempt this replaces,
+        there's no stuck state if the clamp kicks in -- the next update
+        re-fits normally.
 
         self._fitting_content guards the self.resize() call below from
         re-entering resizeEvent(), which calls this method again.
@@ -1365,31 +1495,40 @@ class OverlayWindow(QWidget):
         margins = self.layout().contentsMargins()
         content_width = max(self.width() - margins.left() - margins.right(), 0)
 
-        # Measures the layout's currently-settled total height and the
-        # answer label's currently-settled height BEFORE changing
-        # anything below, giving "everything except the answer label" as
-        # a height, valid right now since nothing's been mutated yet this
-        # call. Reading self.layout().sizeHint() AFTER changing the
-        # label's own setFixedHeight() instead hits a real Qt staleness
-        # bug, confirmed directly (a throwaway probe script against the
-        # real running overlay): it lags exactly one call behind, so a
-        # longer suggestion arriving right after a shorter one measured
-        # as if it were still the shorter one's height. Doing the
-        # subtraction up front, before mutating the label, sidesteps that
-        # entirely -- self._answer_label.height() here is the label's
-        # actual current geometry, not a cached hint, so it's always
-        # accurate.
+        # Measures the layout's currently-settled total height and both
+        # dynamically-sized labels' currently-settled heights BEFORE
+        # changing anything below, giving "everything except those two
+        # labels" as a height, valid right now since nothing's been
+        # mutated yet this call. Reading self.layout().sizeHint() AFTER
+        # changing a label's own setFixedHeight() instead hits a real Qt
+        # staleness bug, confirmed directly (a throwaway probe script
+        # against the real running overlay): it lags exactly one call
+        # behind, so a longer suggestion arriving right after a shorter
+        # one measured as if it were still the shorter one's height. Doing
+        # the subtraction up front, before mutating either label,
+        # sidesteps that entirely -- self._answer_label.height()/
+        # self._questions_label.height() here are each label's actual
+        # current geometry, not a cached hint, so they're always accurate.
         self.layout().activate()
-        chrome_height = self.layout().sizeHint().height() - self._answer_label.height()
+        chrome_height = (
+            self.layout().sizeHint().height()
+            - self._answer_label.height()
+            - self._questions_label.height()
+        )
 
         metrics = QFontMetrics(self._answer_label.font())
-        wrapped_rect = metrics.boundingRect(
+        answer_rect = metrics.boundingRect(
             0, 0, content_width, 0, Qt.TextWordWrap, self._answer_label.text()
         )
+        questions_rect = metrics.boundingRect(
+            0, 0, content_width, 0, Qt.TextWordWrap, self._questions_label.text()
+        )
         self._answer_label.setFixedWidth(content_width)
-        self._answer_label.setFixedHeight(wrapped_rect.height())
+        self._answer_label.setFixedHeight(answer_rect.height())
+        self._questions_label.setFixedWidth(content_width)
+        self._questions_label.setFixedHeight(questions_rect.height())
 
-        target_height = chrome_height + wrapped_rect.height()
+        target_height = chrome_height + answer_rect.height() + questions_rect.height()
         screen = self.screen()
         if screen is not None:
             target_height = min(target_height, screen.availableGeometry().height())
@@ -1489,6 +1628,11 @@ def create_suggestions_window():
     shown before, not appended to a growing list) plus a "Copy Latest
     Suggestion" button.
 
+    Day 32 adds a second, independently-labeled pane below that for the
+    "Suggest Questions" feature's own latest answer (see QuestionsDisplay)
+    -- its own display slot, not shared with the suggestion pane above, so
+    one never overwrites the other.
+
     WA_QuitOnClose is turned off, same reasoning as OverlayWindow's own
     (see that class's docstring): without it, closing the main window
     while this one happens to still be open would leave the app running
@@ -1496,11 +1640,12 @@ def create_suggestions_window():
     -- instead of quitting cleanly.
 
     Returns:
-        tuple[QWidget, QPlainTextEdit, LatestSuggestion]: the window
-        itself (call .show() on it — see main()), the pane to set new
-        suggestion text on, and the tracker the Copy button reads from —
-        the caller should also connect this pane to whatever emits new
-        suggestion text (see create_suggestion_display()).
+        tuple[QWidget, QPlainTextEdit, LatestSuggestion, QPlainTextEdit]:
+        the window itself (call .show() on it — see main()), the
+        suggestion pane, the tracker the Copy button reads from, and the
+        questions pane — the caller should also connect these panes to
+        whatever emits new suggestion/questions text (see
+        create_suggestion_display()/create_questions_display()).
     """
     window = QWidget()
     window.setWindowTitle("Adarna Suggestions")
@@ -1508,6 +1653,7 @@ def create_suggestions_window():
     window.resize(640, 520)
     layout = QVBoxLayout(window)
 
+    layout.addWidget(QLabel("Suggestion"))
     pane = create_readonly_text_pane(layout)
     pane.setStyleSheet("font-size: 15px;")
 
@@ -1522,7 +1668,11 @@ def create_suggestions_window():
     copy_button.clicked.connect(copy_latest_suggestion)
     layout.addWidget(copy_button)
 
-    return window, pane, latest_suggestion
+    layout.addWidget(QLabel("Questions"))
+    questions_pane = create_readonly_text_pane(layout)
+    questions_pane.setStyleSheet("font-size: 15px;")
+
+    return window, pane, latest_suggestion, questions_pane
 
 
 def create_summary_section(layout):
@@ -1571,14 +1721,16 @@ def create_session_recorder():
 
 def connect_session_recorder(wsl_connection, session_recorder):
     """
-    Wires wsl_app's incoming transcript/suggestion messages to
+    Wires wsl_app's incoming transcript/suggestion/questions messages to
     session_recorder, so they're saved to disk whenever a session is
     actively being recorded. Kept connected for the app's whole lifetime,
     same as connect_incoming_messages_to_ui() -- record_transcript()/
-    record_suggestion() are safe no-ops while no session is being recorded.
+    record_suggestion()/record_questions() are all safe no-ops while no
+    session is being recorded.
     """
     wsl_connection.transcript_received.connect(session_recorder.record_transcript)
     wsl_connection.suggestion_received.connect(session_recorder.record_suggestion)
+    wsl_connection.questions_received.connect(session_recorder.record_questions)
 
 
 def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window):
@@ -1592,6 +1744,19 @@ def create_suggestion_display(suggestions_pane, latest_suggestion, overlay_windo
         its update() method (see connect_incoming_messages_to_ui()).
     """
     return SuggestionDisplay(suggestions_pane, latest_suggestion, overlay_window)
+
+
+def create_questions_display(questions_pane, overlay_window):
+    """
+    Creates the QuestionsDisplay that fans out one incoming "Suggest
+    Questions" answer (Day 32) to the Suggestions window's questions pane
+    and the overlay's own questions section.
+
+    Returns:
+        QuestionsDisplay: connect wsl_connection.questions_received to its
+        update() method (see connect_incoming_messages_to_ui()).
+    """
+    return QuestionsDisplay(questions_pane, overlay_window)
 
 
 def create_summary_display(summary_pane, generate_button, save_button):
@@ -1663,27 +1828,33 @@ def create_suggestion_trigger_controls(layout):
     """
     Adds a row with the "Auto-suggest on pause" checkbox (unchecked by
     default — Phase 3, user preference: suggestions should only appear when
-    asked for, via this checkbox or the manual button/hotkey, not fire on
-    every pause unless the user opts in) and a "Generate Suggestion Now"
-    button. Unlike the settings panel above, the checkbox is meant to be
-    flipped live during a running session — see create_session_controls()
-    and wsl_app's SuggestionTrigger — so it lives outside "Session Settings"
-    rather than inside it. The button gives manual triggering an in-window
-    equivalent of the global hotkey, for anyone who'd rather click than
-    reach for a key combination.
+    asked for, via this checkbox or a manual button/hotkey, not fire on
+    every pause unless the user opts in), a "Generate Suggestion Now"
+    button, and a "Questions" button (Day 32) that asks for good clarifying
+    questions to ask right now instead of an answer to give (see wsl_app's
+    request_questions()). Unlike the settings panel above, the checkbox is
+    meant to be flipped live during a running session — see
+    create_session_controls() and wsl_app's SuggestionTrigger — so it lives
+    outside "Session Settings" rather than inside it. Both buttons give
+    manual triggering an in-window equivalent of their own global hotkey/
+    overlay button, for anyone who'd rather click than reach for a key
+    combination or the overlay.
 
     Returns:
-        tuple[QCheckBox, QPushButton]: the auto-suggest checkbox and the
-        manual-trigger button.
+        tuple[QCheckBox, QPushButton, QPushButton]: the auto-suggest
+        checkbox, the manual suggestion-trigger button, and the manual
+        questions-trigger button.
     """
     row = QHBoxLayout()
     auto_suggest_checkbox = QCheckBox("Auto-suggest on pause")
     auto_suggest_checkbox.setChecked(False)
     generate_button = QPushButton("Generate Suggestion Now")
+    questions_button = QPushButton("Questions")
     row.addWidget(auto_suggest_checkbox)
     row.addWidget(generate_button)
+    row.addWidget(questions_button)
     layout.addLayout(row)
-    return auto_suggest_checkbox, generate_button
+    return auto_suggest_checkbox, generate_button, questions_button
 
 
 def create_settings_panel(layout):
@@ -1863,18 +2034,24 @@ def connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox):
     )
 
 
-def connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display, summary_display):
+def connect_incoming_messages_to_ui(
+    wsl_connection, transcript_display, suggestion_display, questions_display, summary_display
+):
     """
-    Wires wsl_app's incoming transcript/suggestion/summary messages to the
-    UI: each transcript message appends one finished sentence to the
-    transcript pane via transcript_display (see TranscriptDisplay), each
-    suggestion is fanned out by suggestion_display to the main pane, the
-    Copy button's tracker, and the overlay's question/answer labels (see
-    SuggestionDisplay), and each summary (or summary_failed) is handled by
-    summary_display (Day 23, see SummaryDisplay).
+    Wires wsl_app's incoming transcript/suggestion/questions/summary
+    messages to the UI: each transcript message appends one finished
+    sentence to the transcript pane via transcript_display (see
+    TranscriptDisplay), each suggestion is fanned out by suggestion_display
+    to the main pane, the Copy button's tracker, and the overlay's answer
+    section (see SuggestionDisplay), each "Suggest Questions" answer (Day
+    32) is fanned out by questions_display the same way to its own,
+    independent pane and overlay section (see QuestionsDisplay), and each
+    summary (or summary_failed) is handled by summary_display (Day 23, see
+    SummaryDisplay).
     """
     wsl_connection.transcript_received.connect(transcript_display.update)
     wsl_connection.suggestion_received.connect(suggestion_display.update)
+    wsl_connection.questions_received.connect(questions_display.update)
     wsl_connection.summary_received.connect(summary_display.update)
     wsl_connection.summary_failed_received.connect(summary_display.handle_failed)
 
@@ -1895,15 +2072,18 @@ def start_wsl_connection(status_label):
     return wsl_connection
 
 
-def create_manual_suggestion_trigger(wsl_connection):
+def create_manual_trigger(wsl_connection, message_type):
     """
-    Creates the shared plumbing behind every way of manually asking for a
-    suggestion right now — the global hotkey and the in-window "Generate
-    Suggestion Now" button both end up calling the function this returns.
-    wsl_app decides whether to actually act on it (it's ignored there if no
-    session is running).
+    Creates the shared plumbing behind every way of manually firing one
+    particular kind of "do it right now" request -- e.g. the global hotkey
+    and the in-window "Generate Suggestion Now" button both ending up
+    calling the function this returns for message_type "hotkey_triggered"
+    (see create_manual_suggestion_trigger()), or the in-window and overlay
+    "Questions" buttons both calling it for "questions_triggered" (Day 32,
+    see create_manual_questions_trigger()). wsl_app decides whether to
+    actually act on it (it's ignored there if no session is running).
 
-    A single persistent worker thread sends every hotkey_triggered message,
+    A single persistent worker thread sends every `message_type` message,
     rather than the caller's own thread sending it directly, and rather
     than spawning a fresh thread per request. A /code-review catch (Day 7):
     spawning a fresh thread per request is fine if send_message() returns
@@ -1913,44 +2093,71 @@ def create_manual_suggestion_trigger(wsl_connection):
     stuck threads for as long as requests kept coming in during the hang.
     One dedicated worker bounds that to a single stuck thread at most; the
     maxsize=1 queue means extra requests while a send is in flight are
-    simply treated as duplicates of the same "generate a suggestion now"
-    request rather than queuing up.
+    simply treated as duplicates of the same request rather than queuing up.
 
     Returns:
-        Callable[[], None]: call this to request a suggestion right now.
+        Callable[[], None]: call this to fire `message_type` right now.
         Safe to call from any thread, including pynput's listener thread —
         see the returned function's own docstring for why that matters.
     """
     pending_requests = queue.Queue(maxsize=1)
 
     def send_trigger_messages_to_wsl_app():
-        """Runs for the app's lifetime: sends one hotkey_triggered message to wsl_app each time the returned function records one."""
+        """Runs for the app's lifetime: sends one `message_type` message to wsl_app each time the returned function records one."""
         while True:
             pending_requests.get()
-            wsl_connection.send_message({"type": "hotkey_triggered"})
+            wsl_connection.send_message({"type": message_type})
 
     threading.Thread(target=send_trigger_messages_to_wsl_app, daemon=True).start()
 
-    def request_suggestion_now():
+    def request_now():
         """
-        Records a request for a suggestion, for send_trigger_messages_to_wsl_app()
+        Records one `message_type` request, for send_trigger_messages_to_wsl_app()
         to actually send. Never sends directly from here: this can be
         called from pynput's own listener thread, which also pumps the
         low-level keyboard hook Windows delivers every key event through,
         so anything that blocks here would delay it from noticing the next
         key press for as long as the block lasts -- and send_message() can
         itself block briefly on the network socket if wsl_app falls behind
-        reading it (see project_notes.md, Day 11). Routing the in-window
-        button's click through the same queue keeps it just as safe, and
-        means a click and a hotkey press pressed at nearly the same moment
-        collapse into one request instead of two.
+        reading it (see project_notes.md, Day 11). Routing every in-window/
+        overlay button click through the same queue keeps it just as safe,
+        and means a click and a hotkey press pressed at nearly the same
+        moment collapse into one request instead of two.
         """
         try:
             pending_requests.put_nowait(None)
         except queue.Full:
             pass  # a send is already pending; this request is a duplicate of that one
 
-    return request_suggestion_now
+    return request_now
+
+
+def create_manual_suggestion_trigger(wsl_connection):
+    """
+    Creates the manual "generate a suggestion now" trigger -- the global
+    hotkey, the in-window "Generate Suggestion Now" button, and the
+    overlay's own "Generate Suggestion" button all end up calling the
+    function this returns. See create_manual_trigger() for the shared
+    dedup-queue/single-worker-thread plumbing behind it.
+
+    Returns:
+        Callable[[], None]: call this to request a suggestion right now.
+    """
+    return create_manual_trigger(wsl_connection, "hotkey_triggered")
+
+
+def create_manual_questions_trigger(wsl_connection):
+    """
+    Creates the manual "suggest questions now" trigger (Day 32) -- the
+    in-window "Questions" button and the overlay's own "Questions" button
+    both end up calling the function this returns. Same shared plumbing as
+    create_manual_suggestion_trigger() (see create_manual_trigger()), just
+    sending "questions_triggered" instead of "hotkey_triggered".
+
+    Returns:
+        Callable[[], None]: call this to request clarifying questions right now.
+    """
+    return create_manual_trigger(wsl_connection, "questions_triggered")
 
 
 def start_global_hotkeys(hotkey_actions):
@@ -2247,18 +2454,24 @@ def main():
     Enabled mute toggle (Day 24, see create_mic_toggle_checkbox), the
     settings panel (including the opt-in "save transcript to a file"
     checkbox -- Day 22, see SessionRecorder), the overlay opacity/
-    click-through controls, the auto-suggest toggle and manual trigger
-    button, the session start/stop controls, the post-meeting summary
-    controls (Day 23, see SummaryDisplay/create_summary_controls), and the
-    global suggestion-trigger and overlay show/hide hotkeys, and runs the
-    event loop until the main window is closed.
+    click-through controls, the auto-suggest toggle and manual
+    suggestion/questions trigger buttons (Day 32 adds "Questions" next to
+    "Generate Suggestion Now", both mirrored on the overlay itself -- see
+    create_manual_questions_trigger()/OverlayWindow._build_button_row()),
+    the session start/stop controls, the post-meeting summary controls
+    (Day 23, see SummaryDisplay/create_summary_controls), and the global
+    suggestion-trigger and overlay show/hide hotkeys, and runs the event
+    loop until the main window is closed.
 
-    Both the overlay and the Suggestions window are answer-only now (Day
-    27) -- the overlay used to also show the transcript excerpt that
-    prompted a suggestion (the "question"), but that was dropped per
-    direct user feedback that it read as noise once you're actually
-    glancing at this live during a call; nothing shows the question
-    anywhere any more.
+    The overlay and the Suggestions window both show a real suggestion's
+    answer text only (Day 27) -- the overlay used to also show the
+    transcript excerpt that prompted a suggestion (the "question"), but
+    that was dropped per direct user feedback that it read as noise once
+    you're actually glancing at this live during a call; nothing shows
+    that transcript excerpt anywhere any more. Day 32's "Suggest Questions"
+    answers are the one exception carved out since: they get their own
+    independent display slot in both places (see QuestionsDisplay), never
+    sharing or overwriting the suggestion answer's own slot.
     """
     app = create_app()
     window = create_window()
@@ -2274,11 +2487,12 @@ def main():
     )
     overlay_window = create_overlay_window()
     create_overlay_controls(layout, overlay_window)
-    auto_suggest_checkbox, generate_suggestion_button = create_suggestion_trigger_controls(layout)
+    auto_suggest_checkbox, generate_suggestion_button, questions_button = create_suggestion_trigger_controls(layout)
     transcript_pane = create_transcript_pane(layout)
     transcript_display = create_transcript_display(transcript_pane)
-    suggestions_window, suggestions_pane, latest_suggestion = create_suggestions_window()
+    suggestions_window, suggestions_pane, latest_suggestion, questions_pane = create_suggestions_window()
     suggestion_display = create_suggestion_display(suggestions_pane, latest_suggestion, overlay_window)
+    questions_display = create_questions_display(questions_pane, overlay_window)
     summary_pane, generate_summary_button, save_summary_button = create_summary_section(layout)
     summary_display = create_summary_display(summary_pane, generate_summary_button, save_summary_button)
     session_recorder = create_session_recorder()
@@ -2301,7 +2515,9 @@ def main():
         mic_enabled_checkbox.setEnabled(False)
 
     wsl_connection = start_wsl_connection(status_label)
-    connect_incoming_messages_to_ui(wsl_connection, transcript_display, suggestion_display, summary_display)
+    connect_incoming_messages_to_ui(
+        wsl_connection, transcript_display, suggestion_display, questions_display, summary_display
+    )
     connect_session_recorder(wsl_connection, session_recorder)
     connect_auto_suggest_toggle(wsl_connection, auto_suggest_checkbox)
     loopback_capture_manager = create_audio_capture_manager(
@@ -2338,7 +2554,11 @@ def main():
     )
     # Kept referenced for the app's lifetime -- see start_global_hotkeys()'s docstring.
     request_suggestion_now = create_manual_suggestion_trigger(wsl_connection)
+    request_questions_now = create_manual_questions_trigger(wsl_connection)
     generate_suggestion_button.clicked.connect(request_suggestion_now)
+    questions_button.clicked.connect(request_questions_now)
+    overlay_window.generate_button.clicked.connect(request_suggestion_now)
+    overlay_window.questions_button.clicked.connect(request_questions_now)
     overlay_toggle = create_overlay_toggle(overlay_window)
     hotkey_listener = start_global_hotkeys(
         {

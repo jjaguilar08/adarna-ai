@@ -787,10 +787,15 @@ async def handle_client(model_manager, reader, writer):
     segmentation and transcription.
 
     A "session" is bounded by explicit session_started/session_stopped
-    messages from windows_app. audio_chunk, hotkey_triggered, and
-    auto_suggest_changed messages are only processed while a session is
-    active — either arriving outside a session is ignored (defensive:
-    windows_app should only be sending them during a session anyway).
+    messages from windows_app. audio_chunk, hotkey_triggered,
+    questions_triggered, and auto_suggest_changed messages are only
+    processed while a session is active — either arriving outside a session
+    is ignored (defensive: windows_app should only be sending them during a
+    session anyway). questions_triggered (Day 32, see request_questions())
+    is dispatched the same session-checking way as hotkey_triggered, since
+    it needs a live session for transcript context, mode, and pending-work
+    state -- unlike generate_summary below, which is deliberately session-
+    less.
     settings_changed just remembers the values it carries (pending_settings)
     for whichever session starts next — windows_app sends it once, right
     before session_started, every time Start Session is pressed, so it's
@@ -830,6 +835,11 @@ async def handle_client(model_manager, reader, writer):
     # after a session has already ended (and torn its own session down), so
     # this can't just reuse a session's own _claude_cli_lock.
     summary_lock = asyncio.Lock()
+    # Guards request_questions() the same way, one per connection -- also
+    # deliberately independent of a session's own _claude_cli_lock (see
+    # that function's docstring for why a questions request and a real
+    # suggestion must never block on each other).
+    questions_lock = asyncio.Lock()
     try:
         while True:
             line = await reader.readline()
@@ -893,6 +903,10 @@ async def handle_client(model_manager, reader, writer):
                 if session is not None:
                     print("Hotkey pressed: generating a suggestion now")
                     session.trigger.notify_hotkey_pressed()
+            elif message_type == "questions_triggered":
+                if session is not None:
+                    print("Questions requested: generating clarifying questions now")
+                    asyncio.create_task(request_questions(writer, session, questions_lock))
             elif message_type == "settings_changed":
                 pending_settings = settings_from_message(message)
             elif message_type == "auto_suggest_changed":
@@ -1076,6 +1090,41 @@ MEETING_SYSTEM_PROMPT = (
     "being discussed. " + RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION
 )
 
+# Shape instruction for the "Suggest Questions" feature (Day 32) -- a
+# separate manual trigger, parallel to the existing "Generate Suggestion
+# Now" flow, that asks for good clarifying questions to ask right now
+# rather than an answer to give. Reuses SPEAKABLE_WORDING_INSTRUCTION and
+# IGNORE_TRANSCRIPT_NOISE_INSTRUCTION verbatim (both are about the answer's
+# delivery/robustness, not its shape, so they apply here unchanged). In
+# place of CONTENT_NOT_OUTLINE_INSTRUCTION's "write the content, not an
+# outline of it" framing, this needs its own questions-specific version of
+# the same underlying lesson (a concrete example is what actually moves
+# model behavior here, per this file's own established CONTENT_NOT_OUTLINE_
+# INSTRUCTION/SPEAKABLE_WORDING_INSTRUCTION revision history above): a
+# question suggestion needs to be the literal question to ask out loud, not
+# a description of a topic to ask about.
+RESPOND_WITH_QUESTIONS_INSTRUCTION = (
+    "Respond in plain text only -- no markdown headers, bold, or numbered "
+    "lists -- as 2-4 questions, one per line, each on its own line "
+    "starting with \"- \". No lead-in sentence, no closing sentence, "
+    "nothing before or after the questions themselves.\n\n"
+    "Every question must be the actual question the user would ask out "
+    "loud, grounded in something specific just said -- never a generic "
+    "template question, and never a line that describes a topic to ask "
+    "about instead of asking it. For example, do NOT write \"- Ask about "
+    "the team's deployment process\" -- write the real question directly: "
+    "\"- How often does the team deploy to production?\"\n\n"
+    + SPEAKABLE_WORDING_INSTRUCTION + "\n\n"
+    + IGNORE_TRANSCRIPT_NOISE_INSTRUCTION
+)
+
+QUESTIONS_MEETING_SYSTEM_PROMPT = (
+    "You are assisting the user live during a work meeting. Given a "
+    "snippet of recent conversation, suggest good clarifying questions the "
+    "user could ask right now to improve their understanding of what's "
+    "being discussed. " + RESPOND_WITH_QUESTIONS_INSTRUCTION
+)
+
 # Interview mode's own shape, separate from RESPOND_WITH_LEAD_AND_BULLETS_INSTRUCTION
 # above (Meeting mode keeps that shorter, casual shape unchanged). Revised
 # Day 18 after a real example (a full behavioral-interview answer) showed
@@ -1147,9 +1196,27 @@ INTERVIEW_SYSTEM_PROMPT = (
     "could answer it. " + INTERVIEW_RESPOND_INSTRUCTION
 )
 
+# Interview mode's own "Suggest Questions" framing -- the questions the
+# candidate (the user) could ask the interviewer, not questions to ask a
+# meeting participant. Shares RESPOND_WITH_QUESTIONS_INSTRUCTION's shape
+# with QUESTIONS_MEETING_SYSTEM_PROMPT above; only the framing sentence
+# differs, same split as MEETING_SYSTEM_PROMPT/INTERVIEW_SYSTEM_PROMPT.
+QUESTIONS_INTERVIEW_SYSTEM_PROMPT = (
+    "You are assisting the user live during a job interview, in which the "
+    "user is the candidate being interviewed. Given a snippet of the "
+    "interviewer's most recent question or remark, suggest good questions "
+    "the user could ask the interviewer in response. "
+    + RESPOND_WITH_QUESTIONS_INSTRUCTION
+)
+
 SYSTEM_PROMPT_BY_MODE = {
     "meeting": MEETING_SYSTEM_PROMPT,
     "interview": INTERVIEW_SYSTEM_PROMPT,
+}
+
+QUESTIONS_SYSTEM_PROMPT_BY_MODE = {
+    "meeting": QUESTIONS_MEETING_SYSTEM_PROMPT,
+    "interview": QUESTIONS_INTERVIEW_SYSTEM_PROMPT,
 }
 
 # Framing for a post-meeting summary (Day 23, PRD §8 Phase 3) -- one shared
@@ -1209,6 +1276,27 @@ def build_system_prompt(mode, context_notes):
         prompt += (
             "\n\nThe user has also provided the following context notes for "
             "this session — use them to inform your suggestions where "
+            "relevant:\n" + context_notes
+        )
+    return prompt
+
+
+def build_questions_system_prompt(mode, context_notes):
+    """
+    Builds the full system prompt for a "Suggest Questions" request:
+    the mode's question-framing (see QUESTIONS_SYSTEM_PROMPT_BY_MODE), plus
+    the user's pre-session context notes appended if they provided any.
+    Mirrors build_system_prompt exactly, just sourced from QUESTIONS_
+    SYSTEM_PROMPT_BY_MODE instead of SYSTEM_PROMPT_BY_MODE.
+
+    Returns:
+        str: the system prompt to start a one-shot questions ClaudeCli with.
+    """
+    prompt = QUESTIONS_SYSTEM_PROMPT_BY_MODE.get(mode, QUESTIONS_MEETING_SYSTEM_PROMPT)
+    if context_notes:
+        prompt += (
+            "\n\nThe user has also provided the following context notes for "
+            "this session — use them to inform your questions where "
             "relevant:\n" + context_notes
         )
     return prompt
@@ -1447,6 +1535,13 @@ class LiveAgentLog:
         timestamp = time.strftime("%H:%M:%S")
         self._write(f"{timestamp} TRIGGER")
 
+    def record_questions_trigger(self):
+        """Appends one timestamped TRIGGER QUESTIONS line -- distinct from record_trigger()'s bare TRIGGER, so a tailing live-agent-listening session can tell a "Suggest Questions" trigger apart from a real answer-trigger (this class's own documented contract for what a bare TRIGGER means) -- if a session is currently exporting."""
+        if self._file is None:
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        self._write(f"{timestamp} TRIGGER QUESTIONS")
+
     def _write(self, line):
         """Writes one line to the open file and flushes immediately, so partial content already on disk survives a crash."""
         self._file.write(line + "\n")
@@ -1627,6 +1722,8 @@ class MeetingSession:
         """
         self.writer = writer
         self.model = model
+        self.mode = mode
+        self.context_notes = context_notes
         self.segmenters = {
             source: VoiceSegmenter(SPEECH_DETECTION_STRICTNESS_BY_SOURCE[source]) for source in AUDIO_SOURCES
         }
@@ -1925,6 +2022,88 @@ class MeetingSession:
         self.trigger.stop()
         async with self._claude_cli_lock:
             await asyncio.to_thread(self._claude_cli.stop)
+
+
+async def request_questions(writer, session, questions_lock):
+    """
+    Generates one "Suggest Questions" answer (Day 32) from a live session's
+    current rolling transcript context and sends it to windows_app as a
+    "questions" message -- a manual, one-shot trigger parallel to a real
+    suggestion (see MeetingSession._generate_and_send_suggestion), but
+    using its own fresh, one-shot ClaudeCli (started, asked once, and
+    stopped all within this one call, the same one-shot shape
+    generate_and_send_summary uses below) rather than the session's own
+    self._claude_cli. Deliberately independent of that CLI process and its
+    lock (session._claude_cli_lock stays completely untouched here) -- a
+    questions request must never block on, or be blocked by, a real
+    suggestion already being generated, and vice versa. `questions_lock`
+    (one per connection, created in handle_client alongside summary_lock)
+    instead guards this function the same way summary_lock guards
+    generate_and_send_summary: skipped, not queued, if a questions request
+    is already in flight.
+
+    If a segment is still mid-speech or mid-transcription when this fires,
+    waits for it to clear first (bounded by MANUAL_TRIGGER_MAX_WAIT_SECONDS,
+    via session._wait_for_pending_transcriptions() -- the same polling
+    pattern and bound _generate_and_send_suggestion uses under its own
+    lock), sending one placeholder "questions" message in the meantime so
+    the display doesn't just sit blank. If there's still no transcript
+    context at all once that clears (has_pending_transcription_work() timed
+    out with nothing ever captured), this returns without generating
+    anything.
+
+    Because this shares no lock or lifecycle with MeetingSession.close(), a
+    "questions" answer can legitimately arrive at windows_app after the
+    session that produced its transcript context has already been torn
+    down server-side (session=None, "Session stopped" already printed,
+    close() already run). This is accepted, not a bug: close() never
+    touches self.segmenters, self.recent_transcript_segments,
+    self._pending_transcriptions, self.mode, or self.context_notes, so
+    reading them here after close() has run is a safe plain read -- it
+    mirrors how a post-meeting summary already arrives after the session
+    that produced its transcript has ended.
+    """
+    if questions_lock.locked():
+        return
+    async with questions_lock:
+        if session.has_pending_transcription_work():
+            await send_message(
+                writer,
+                {
+                    "type": "questions",
+                    "text": "Still capturing the last few words…",
+                    "question": session._format_context(),
+                },
+            )
+            await session._wait_for_pending_transcriptions()
+
+        prompt_text = session._format_context()
+        if not prompt_text:
+            return
+
+        session.live_agent_log.record_questions_trigger()
+        system_prompt = build_questions_system_prompt(session.mode, session.context_notes)
+        claude_cli = ClaudeCli(system_prompt)
+        try:
+            questions_text = await asyncio.to_thread(claude_cli.ask, prompt_text)
+        except RuntimeError as error:
+            print(f"Couldn't generate questions: {error}")
+            questions_text = None
+        try:
+            await asyncio.to_thread(claude_cli.stop)
+        except Exception as error:
+            # The process is already dead or misbehaving -- nothing to do
+            # about that, and it must not stop the questions (if any) from
+            # still being sent below.
+            print(f"Error stopping questions claude CLI process (ignoring): {error}")
+        if not questions_text or not questions_text.strip():
+            return
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] Questions: {questions_text}")
+        await send_message(
+            writer,
+            {"type": "questions", "text": questions_text, "question": prompt_text},
+        )
 
 
 async def generate_and_send_summary(writer, transcript_text, summary_lock):
