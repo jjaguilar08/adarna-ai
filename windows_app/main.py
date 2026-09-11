@@ -91,12 +91,27 @@ MAX_QUEUED_AUDIO_BLOCKS = 50
 # the more actively-maintained, purpose-built API for exactly this. See
 # project_notes.md (Day 7) for the empirical testing done before picking
 # one.
-HOTKEY_COMBINATION = "<ctrl>+<alt>+<space>"
+#
+# Rebound from "<ctrl>+<alt>+<space>" to "<ctrl>+<alt>+a" (Day 32 follow-up),
+# to free up a plain, easy-to-reach combination for the new "Suggest
+# Questions" hotkey (QUESTIONS_HOTKEY_COMBINATION below) rather than
+# reaching for something more awkward for the newer action.
+HOTKEY_COMBINATION = "<ctrl>+<alt>+a"
+
+# Global "suggest questions now" hotkey (Day 32, see
+# create_manual_questions_trigger()) -- the questions-trigger equivalent of
+# HOTKEY_COMBINATION above. Deliberately a distinct combination from both
+# HOTKEY_COMBINATION and OVERLAY_HOTKEY_COMBINATION -- pynput's
+# GlobalHotKeys registers all three from one shared listener (see
+# start_global_hotkeys()), and dispatches each independently, so none of
+# them interfere with each other.
+QUESTIONS_HOTKEY_COMBINATION = "<ctrl>+<alt>+q"
 
 # Global show/hide hotkey for the overlay window (see create_overlay_window()).
-# Deliberately a different combination from HOTKEY_COMBINATION above -- pynput's
-# GlobalHotKeys registers both from one shared listener (see start_global_hotkeys()),
-# and dispatches each independently, so the two don't interfere with each other.
+# Deliberately a different combination from HOTKEY_COMBINATION/
+# QUESTIONS_HOTKEY_COMBINATION above -- pynput's GlobalHotKeys registers all
+# three from one shared listener (see start_global_hotkeys()), and
+# dispatches each independently, so none of them interfere with each other.
 OVERLAY_HOTKEY_COMBINATION = "<ctrl>+<alt>+o"
 
 # Settings panel choices, sent to wsl_app as settings_changed when a session
@@ -2163,7 +2178,8 @@ def create_manual_questions_trigger(wsl_connection):
 def start_global_hotkeys(hotkey_actions):
     """
     Registers every global hotkey the app listens for -- currently the
-    "generate a suggestion now" hotkey (HOTKEY_COMBINATION) and the
+    "generate a suggestion now" hotkey (HOTKEY_COMBINATION), the "suggest
+    questions now" hotkey (QUESTIONS_HOTKEY_COMBINATION, Day 32), and the
     overlay show/hide hotkey (OVERLAY_HOTKEY_COMBINATION) -- from one
     shared pynput.keyboard.GlobalHotKeys listener. Must work even while
     windows_app doesn't have focus (the user will be focused on their
@@ -2563,6 +2579,7 @@ def main():
     hotkey_listener = start_global_hotkeys(
         {
             HOTKEY_COMBINATION: request_suggestion_now,
+            QUESTIONS_HOTKEY_COMBINATION: request_questions_now,
             OVERLAY_HOTKEY_COMBINATION: overlay_toggle.toggle_requested.emit,
         }
     )
